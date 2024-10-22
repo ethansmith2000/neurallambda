@@ -347,12 +347,14 @@ class NShotTaskSampler(IterableDataset):
 
         support_set = []
         query_set = []
-        for class_idx, class_label in enumerate(classes):
+        class_ixs = list(range(len(classes)))
+        random.shuffle(class_ixs)
+        for class_ix, class_label in zip(class_ixs, classes):
             class_instances = [i for i, label in enumerate(self.labels) if label == class_label]
             selected_instances = random.sample(class_instances, self.k_shot + self.q_query)
 
-            support_set.extend((self.dataset[i][0], class_idx) for i in selected_instances[:self.k_shot])
-            query_set.extend((self.dataset[i][0], class_idx) for i in selected_instances[self.k_shot:])
+            support_set.extend((self.dataset[i][0], class_ix) for i in selected_instances[:self.k_shot])
+            query_set.extend((self.dataset[i][0], class_ix) for i in selected_instances[self.k_shot:])
 
         random.shuffle(query_set)
         return support_set, query_set
@@ -466,7 +468,7 @@ if False:
     train_alphabets = ["Latin", "Greek"]
     test_alphabets = ["Mongolian"]
     n_way = 5
-    k_shot = 2
+    k_shot = 4
     q_query = 1
     num_tasks = 100
     image_size = 28
