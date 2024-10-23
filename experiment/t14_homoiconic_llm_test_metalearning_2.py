@@ -34,16 +34,26 @@ PROVENANCE:
 
 
 NaN ISSUES:
-- rmsprop and adam do `sqrt(avg)` which if negative yields NaN
+- rmsprop and adam have issues during the backward pass of the outerloop, and throw NaNs (at least I think this is where the NaNs are coming from. NaNs show up in weights after outer loop, so immediately bork the next fwd pass)
+
+SPEEDING UP ITERATION:
+- truncating model
+- smaller N classes helps speed up iteration
+- turn off tensorboard logging
+
+STABILIZATION:
+- sgd_momentum, lr=1.0, N_LOOP=20
+- rmsprop and adam NaN issue
+
 
 TODO:
 - [ ] fix run_epoch
-  - [ ] update for new dataset
-  - [ ] add image projector
-  - [ ] tokenize labels
-  - [ ] append metatokens
-  - [ ] metalearn them
-  - [ ] prove loss can decrease for supports before worrying about queries
+  - [X] update for new dataset
+  - [X] add image projector
+  - [X] tokenize labels
+  - [X] append metatokens
+  - [X] metalearn them
+  - [X] prove loss can decrease for supports before worrying about queries
   - [ ] test on queries
 
 - options
@@ -267,22 +277,6 @@ def sgd(params, grads, lr=0.01):
 ##########
 # SGD Momentum
 
-
-# DICT VARIANT
-
-# def sgd_momentum_init(params):
-#     return {k: torch.zeros_like(p) for k, p in params.items()}
-
-# def sgd_momentum(params, grads, velocity, lr=0.01, momentum=0.9):
-#     updated_params = {}
-#     updated_velocity = {}
-#     for k in params.keys():
-#         v_new = momentum * velocity[k] + lr * grads[k]
-#         updated_params[k] = params[k] - v_new
-#         updated_velocity[k] = v_new
-#     return updated_params, updated_velocity
-
-
 def sgd_momentum_init(params):
     return [torch.zeros_like(p) for p in params]
 
@@ -295,57 +289,34 @@ def sgd_momentum(params, grads, velocity, lr=0.01, momentum=0.9):
 ##########
 # RMSProp
 
-
-# # DICT VARIANT
-# def rmsprop_init(params):
-#     return {k: torch.zeros_like(p) for k, p in params.items()}  # square averages
-
-# def rmsprop(params, grads, square_avg, lr=0.01, alpha=0.99, eps=1e-8):
-#     updated_params = {}
-#     updated_square_avg = {}
-#     for k in params.keys():
-#         avg_new = alpha * square_avg[k] + (1 - alpha) * grads[k].pow(2)
-#         updated_params[k] = params[k] - lr * grads[k] / (avg_new.sqrt() + eps)
-#         updated_square_avg[k] = avg_new
-#     return updated_params, updated_square_avg
-
-
 def rmsprop_init(params):
     return [torch.zeros_like(p) for p in params]  # square averages
 
 def rmsprop(params, grads, square_avg, lr=0.01, alpha=0.99, eps=1e-8):
+
+    for p, g in zip(params, grads):
+        if p.isnan().any() or g.isnan().any() or p.isinf().any() or g.isinf().any():
+            print('FIRST')
+            print(f'{p.isnan().any()=},  {g.isnan().any()=}, {p.isinf().any()=}, {g.isinf().any()=}')
+            breakpoint()
+
+
     updated_square_avg = [alpha * avg + (1 - alpha) * g.pow(2) for avg, g in zip(square_avg, grads)]
     updated_params = [p - lr * g / (avg.sqrt() + eps)
                       for p, g, avg in zip(params, grads, updated_square_avg)]
+
+
+    for p, g in zip(params, grads):
+        if p.isnan().any() or g.isnan().any() or p.isinf().any() or g.isinf().any():
+            print('SECOND')
+            print(f'{p.isnan().any()=},  {g.isnan().any()=}, {p.isinf().any()=}, {g.isinf().any()=}')
+            breakpoint()
+
     return updated_params, updated_square_avg
 
 
 ##########
 # ADAM
-
-# # DICT VARIANT
-# def adam_init(params):
-#     return (
-#         {k: torch.zeros_like(p) for k, p in params.items()},  # m
-#         {k: torch.zeros_like(p) for k, p in params.items()},  # v
-#         0  # t
-#     )
-
-# def adam(params, grads, m, v, t, lr=0.001, betas=(0.9, 0.999), eps=1e-8):
-#     updated_params = {}
-#     updated_m = {}
-#     updated_v = {}
-#     t += 1
-#     for k in params.keys():
-#         m_new = betas[0] * m[k] + (1 - betas[0]) * grads[k]
-#         v_new = betas[1] * v[k] + (1 - betas[1]) * grads[k].pow(2)
-#         m_hat = m_new / (1 - betas[0]**t)
-#         v_hat = v_new / (1 - betas[1]**t)
-#         updated_params[k] = params[k] - lr * m_hat / (v_hat.sqrt() + eps)
-#         updated_m[k] = m_new
-#         updated_v[k] = v_new
-#     return updated_params, updated_m, updated_v, t
-
 
 def adam_init(params):
     return (
@@ -368,6 +339,56 @@ def adam(params, grads, m, v, t, lr=0.001, betas=(0.9, 0.999), eps=1e-8):
                       for p, mh, vh in zip(params, m_hat, v_hat)]
 
     return updated_params, updated_m, updated_v, t
+
+
+##########
+# Adamax
+
+def adamax_init(params):
+    return (
+        [torch.zeros_like(p) for p in params],  # m (first moment)
+        [torch.zeros_like(p) for p in params],  # u (infinity norm)
+        0  # t (timestep)
+    )
+
+def adamax(params, grads, m, u, t, lr=0.002, betas=(0.9, 0.999), eps=1e-8):
+    """
+    Implements Adamax optimization algorithm (a variant of Adam based on infinity norm).
+
+    Args:
+        params: List of parameters
+        grads: List of gradients
+        m: List of first moment vectors
+        u: List of infinity norm vectors
+        t: Integer, timestep counter
+        lr: Float, learning rate (default: 0.002)
+        betas: Tuple of coefficients for computing running averages
+        eps: Term for numerical stability
+
+    Returns:
+        (updated_params, updated_m, updated_u, t)
+    """
+    t += 1
+
+    # Update biased first moment estimate
+    updated_m = [betas[0] * m_i + (1 - betas[0]) * g
+                 for m_i, g in zip(m, grads)]
+
+    # Update the infinity norm estimate
+    # u_t = max(beta_2 * u_{t-1}, |g_t|)
+    updated_u = [torch.maximum(betas[1] * u_i, torch.abs(g))
+                 for u_i, g in zip(u, grads)]
+
+    # Bias correction for the first moment
+    # Note: infinity norm doesn't need bias correction
+    m_hat = [m_i / (1 - betas[0]**t) for m_i in updated_m]
+
+    # Update parameters
+    # theta_t = theta_{t-1} - (alpha / u_t) * m_hat_t
+    updated_params = [p - (lr / (u_i + eps)) * mh
+                      for p, mh, u_i in zip(params, m_hat, updated_u)]
+
+    return updated_params, updated_m, updated_u, t
 
 
 ##################################################
@@ -1004,7 +1025,6 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
             B, Ss = support_labels.shape  # batch size, sequence (N*k)
             Sq = query_labels.shape[1]  # N*q
 
-
             # EXPERIMENT: random metaweights
             metaweights = torch.randn(B, N_METAWEIGHTS, D, device=device) * 1e-3  # TODO: what should this init be?
 
@@ -1041,7 +1061,6 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
 
             # iterate over supports and do SGD on LoRs
 
-            N_LOOPS = 20
             with torch.enable_grad():
                 opt_state = None  # will set first time this is needed
 
@@ -1105,15 +1124,27 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
                         print(f'iloss: {loss.item():>.6f}')
 
                     if opt_state is None:
-                        opt_state = sgd_momentum_init(params)
-                        # opt_state = rmsprop_init(params)
-                        # opt_state = adam_init(params)
-                        pass
+                        match INNER_OPT:
+                            case 'sgd_momentum':
+                                opt_state = sgd_momentum_init(params)
+                            case 'rmsprop':
+                                opt_state = rmsprop_init(params)
+                            case 'adam':
+                                opt_state = adam_init(params)
+                            case 'adamax':
+                                opt_state = adamax_init(params)
 
-                    # new_params = sgd(params, grads, lr=inner_lr)
-                    new_params, opt_state = sgd_momentum(params, grads, opt_state, lr=inner_lr)
-                    # new_params, opt_state = rmsprop(params, grads, opt_state, lr=inner_lr)
-                    # new_params, *opt_state = adam(params, grads, *opt_state, lr=inner_lr)
+                    match INNER_OPT:
+                        case 'sgd':
+                            new_params = sgd(params, grads, lr=inner_lr)
+                        case 'sgd_momentum':
+                            new_params, opt_state = sgd_momentum(params, grads, opt_state, lr=inner_lr)
+                        case 'rmsprop':
+                            new_params, opt_state = rmsprop(params, grads, opt_state, lr=inner_lr)
+                        case 'adam':
+                            new_params, *opt_state = adam(params, grads, *opt_state, lr=inner_lr)
+                        case 'adamax':
+                            new_params, *opt_state = adamax(params, grads, *opt_state, lr=inner_lr)
 
                     lor_cache = empty_lors(model.config.num_hidden_layers)
                     for (k, lix, tuple_ix), p in zip(key_ixs, new_params):
@@ -1236,7 +1267,7 @@ global_epoch = 0
 train_alphabets = ["Latin", "Greek"]
 test_alphabets = ["Mongolian"]
 img_size = 28
-n_way = 2  # N-way classification
+n_way = 3  # N-way classification
 k_shot = 1  # k-shot learning
 q_query = 1  # query examples per class
 num_tasks = 100  # number of tasks per epoch
@@ -1247,7 +1278,29 @@ batch_size = 32
 lr = 1e-4
 wd = 1e-2
 
-inner_lr = 1.0  # SGD-momentum needs much higher lr
+
+# INNER_OPT = 'sgd'
+INNER_OPT = 'sgd_momentum'
+# INNER_OPT = 'rmsprop'
+# INNER_OPT = 'adam'
+# INNER_OPT = 'adamax'
+
+match INNER_OPT:
+    case 'sgd':
+        INNER_LR = 1.0  # SGD-momentum needs much higher lr
+        N_LOOPS = 20
+    case 'sgd_momentum':
+        INNER_LR = 1.0  # SGD-momentum needs much higher lr
+        N_LOOPS = 20
+    case 'rmsprop':
+        INNER_LR = 1e-1
+        N_LOOPS = 20
+    case 'adam':
+        INNER_LR = 1e-1
+        N_LOOPS = 20
+    case 'adamax':
+        INNER_LR = 1e-2
+        N_LOOPS = 20
 
 
 ##########
@@ -1433,13 +1486,13 @@ for epoch in range(num_epochs):
     global_epoch += 1
 
     # with torch.autograd.detect_anomaly():
-    train_loss = run_epoch(model, img_proj, lor_models, inner_lr, train_dl, optimizer, DEVICE, train=True)
+    train_loss = run_epoch(model, img_proj, lor_models, INNER_LR, train_dl, optimizer, DEVICE, train=True)
 
     train_losses.append(train_loss)
     if LOG: writer.add_scalars('loss', {'train': train_loss}, global_epoch)
 
     if epoch % 5 == 0:
-        test_loss = run_epoch(model, img_proj, lor_models, inner_lr, test_dl, optimizer, DEVICE, train=False)
+        test_loss = run_epoch(model, img_proj, lor_models, INNER_LR, test_dl, optimizer, DEVICE, train=False)
         test_losses.append(test_loss)
         if LOG: writer.add_scalars('loss', {'test': test_loss}, global_epoch)
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}")
@@ -1463,3 +1516,18 @@ if num_epochs > 0:
 
     # Show the plot
     plt.show()
+
+
+
+
+
+
+for k in lor_models.keys():
+    for lix in range(len(lor_models[k])):
+        if lor_models[k][lix] is None:
+            continue
+        for n, p in lor_models[k][lix].named_parameters():
+            print()
+            print(n)
+            xs = [f'{x:>.3f}' for x in p.flatten()[:10].tolist()]
+            print(f'{p.min().item():>.3f}, {p.max().item():>.3f}, {p.mean().item():>.3f}, {p.std().item():>.3f}, {xs}')
