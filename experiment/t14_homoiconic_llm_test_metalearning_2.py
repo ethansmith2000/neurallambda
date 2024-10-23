@@ -33,6 +33,9 @@ PROVENANCE:
 - t13_metalearning_hypernet_03
 
 
+NaN ISSUES:
+- rmsprop and adam do `sqrt(avg)` which if negative yields NaN
+
 TODO:
 - [ ] fix run_epoch
   - [ ] update for new dataset
@@ -50,6 +53,9 @@ TODO:
 '''
 
 import os
+import sys
+import traceback
+import importlib
 import random
 from typing import List, Dict, Any, Tuple
 from tqdm import tqdm
@@ -64,21 +70,23 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer
 
+import numpy as np
 import matplotlib.pyplot as plt
 
 from t13_metalearning_hypernet_data import omniglot_n_way_k_shot, ALPHABET_DICT
 from neurallambda.lab.common import print_model_info
 
-try:
-    importlib.reload(Q)
+if 't14_homoiconic_llm_model_03' in sys.modules:
     print('RELOADING Q')
-except NameError:
+    importlib.reload(sys.modules['t14_homoiconic_llm_model_03'])
+else:
     import t14_homoiconic_llm_model_03 as Q
 
 
 current_time = datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
 writer = SummaryWriter(f'log/t14_homoiconic_llm_test_metalearning_2/{current_time}')
-LOG = True
+
+LOG = False  # slows down training to ~0.5x
 
 SEED = 152
 torch.manual_seed(SEED)
@@ -87,7 +95,7 @@ random.seed(SEED)
 DEVICE = 'cuda'
 WHICH_LOR = 1
 N_METAWEIGHTS = 14  # QKVOGUD * 2
-LOR_LAYER = 14  # half wayish
+LOR_LAYER = 2  # target of LOR stuff
 
 
 ##################################################
@@ -102,13 +110,79 @@ def hook_fn(module, input, output):
         isnan = torch.isnan(output).any()
         isinf = torch.isinf(output).any()
         if isnan or isinf:
-            print(f"NaN or inf detected in {module.__class__.__name__}: {isnan=}, {isinf=}")
+            print('\n' * 3)
+            print(f"NaN or inf detected in {module.__class__.__name__}: isnan:{isnan.item()}, isinf{isinf.item()}")
             print(f"Module: {module}")
             print(f"Module name: {module_names.get(module, 'Unknown')}")
             print(f"Input shape: {[i.shape if isinstance(i, torch.Tensor) else type(i) for i in input]}")
             print(f"Output shape: {output.shape}")
             breakpoint()
             # raise RuntimeError("NaN or inf detected: {isnan=}, {isinf=}")
+
+
+def hook_fn(module, input, output):
+    if isinstance(output, torch.Tensor):
+        # isnan_in = torch.isnan(input).any()  # inputs are a tuple
+        # isinf_in = torch.isinf(input).any()
+        isnan_out = torch.isnan(output).any()
+        isinf_out = torch.isinf(output).any()
+        if isnan_out or isinf_out:  # or isnan_in or isinf_in:
+            # Get the current stack trace
+            stack = traceback.extract_stack()
+            # Remove the last entry which is this function call
+            stack = stack[:-1]
+
+            print('\n' * 3)
+            print("=" * 80)
+            print("NaN/Inf Detection Report")
+            print("=" * 80)
+
+            print("\nISSUE DETECTED:")
+            # print(f"- NaN Input detected: {isnan_in.item()}")
+            # print(f"- Inf Input detected: {isinf_in.item()}")
+            print(f"- NaN Output detected: {isnan_out.item()}")
+            print(f"- Inf Output detected: {isinf_out.item()}")
+
+            print("\nMODULE INFORMATION:")
+            print(f"- Class: {module.__class__.__name__}")
+            print(f"- Full module: {module}")
+            print(f"- Module name: {module_names.get(module, 'Unknown')}")
+
+            print("\nTENSOR SHAPES:")
+            print(f"- Input shapes: {[i.shape if isinstance(i, torch.Tensor) else type(i) for i in input]}")
+            print(f"- Output shape: {output.shape}")
+
+            print("\nSTACK TRACE:")
+            for filename, lineno, funcname, line in stack:
+                rel_path = os.path.relpath(filename)  # Get relative path for cleaner output
+                if 'site-packages' in rel_path:  # skip library stack trace
+                    continue
+                print(f"  File '{rel_path}', line {lineno}, in {funcname}")
+                if line:
+                    print(f"    {line.strip()}")
+
+            print("\nTENSOR STATISTICS:")
+
+            # if not torch.all(torch.isinf(input)):
+            #     print("- Input stats (excluding inf):")
+            #     valid_input = input[~torch.isinf(input)]
+            #     if len(valid_input) > 0:
+            #         print(f"  - Mean: {valid_input.mean().item():.6f}")
+            #         print(f"  - Std: {valid_input.std().item():.6f}")
+            #         print(f"  - Min: {valid_input.min().item():.6f}")
+            #         print(f"  - Max: {valid_input.max().item():.6f}")
+
+            if not torch.all(torch.isinf(output)):
+                print("- Output stats (excluding inf):")
+                valid_output = output[~torch.isinf(output)]
+                if len(valid_output) > 0:
+                    print(f"  - Mean: {valid_output.mean().item():.6f}")
+                    print(f"  - Std: {valid_output.std().item():.6f}")
+                    print(f"  - Min: {valid_output.min().item():.6f}")
+                    print(f"  - Max: {valid_output.max().item():.6f}")
+
+            print("\nDebugger starting...")
+            breakpoint()
 
 module_names = {}
 
@@ -118,6 +192,7 @@ def add_hooks(model):
         module.register_forward_hook(hook_fn)
 
 try:
+    fail
     already_loaded
 except:
     print('Loading model')
@@ -133,10 +208,44 @@ except:
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'
 
-    num_layers = model.config.num_hidden_layers
 
     add_hooks(model)
     already_loaded = True
+
+
+
+if True:
+    warnings.warn('TRUNCATING MODEL LAYERS')
+    model.model.layers = model.model.layers[0:3] + model.model.layers[-3:]
+    for ix in range(len(model.model.layers)):
+        model.model.layers[ix].layer_idx = ix
+        model.model.layers[ix].self_attn.layer_idx = ix
+
+if True:
+    warnings.warn('TRUNCATING MODEL EMBEDDINGS')
+
+    assert id(model.lm_head.weight) == id(model.model.embed_tokens.weight), 'model does not have tied weights, but truncation expects it'
+
+    TRUNCATE_EMB_SIZE = 1000
+
+    new_embs = nn.Parameter(
+        model.model.embed_tokens.weight[:TRUNCATE_EMB_SIZE].clone(),
+        requires_grad=model.model.embed_tokens.weight.requires_grad
+    )
+
+    model.model.embed_tokens.weight = new_embs
+    model.model.config.num_hidden_layers = len(model.model.layers)
+    model.model.config.vocab_size = model.model.embed_tokens.weight.shape[0]
+
+    model.lm_head.weight = new_embs
+
+num_layers = model.config.num_hidden_layers
+
+print_model_info(model)
+
+
+
+
 
 
 
@@ -150,68 +259,114 @@ except:
 # SGD
 
 def sgd(params, grads, lr=0.01):
-
     # # structured dict variant
     # return {k: p - grads[k] * lr for k, p in params.items()}
-
     return [p - g * lr for p, g in zip(params, grads)]
 
 
 ##########
 # SGD Momentum
 
+
+# DICT VARIANT
+
+# def sgd_momentum_init(params):
+#     return {k: torch.zeros_like(p) for k, p in params.items()}
+
+# def sgd_momentum(params, grads, velocity, lr=0.01, momentum=0.9):
+#     updated_params = {}
+#     updated_velocity = {}
+#     for k in params.keys():
+#         v_new = momentum * velocity[k] + lr * grads[k]
+#         updated_params[k] = params[k] - v_new
+#         updated_velocity[k] = v_new
+#     return updated_params, updated_velocity
+
+
 def sgd_momentum_init(params):
-    return {k: torch.zeros_like(p) for k, p in params.items()}
+    return [torch.zeros_like(p) for p in params]
 
 def sgd_momentum(params, grads, velocity, lr=0.01, momentum=0.9):
-    updated_params = {}
-    updated_velocity = {}
-    for k in params.keys():
-        v_new = momentum * velocity[k] + lr * grads[k]
-        updated_params[k] = params[k] - v_new
-        updated_velocity[k] = v_new
+    updated_velocity = [momentum * v + lr * g for v, g in zip(velocity, grads)]
+    updated_params = [p - v for p, v in zip(params, updated_velocity)]
     return updated_params, updated_velocity
 
 
 ##########
 # RMSProp
 
+
+# # DICT VARIANT
+# def rmsprop_init(params):
+#     return {k: torch.zeros_like(p) for k, p in params.items()}  # square averages
+
+# def rmsprop(params, grads, square_avg, lr=0.01, alpha=0.99, eps=1e-8):
+#     updated_params = {}
+#     updated_square_avg = {}
+#     for k in params.keys():
+#         avg_new = alpha * square_avg[k] + (1 - alpha) * grads[k].pow(2)
+#         updated_params[k] = params[k] - lr * grads[k] / (avg_new.sqrt() + eps)
+#         updated_square_avg[k] = avg_new
+#     return updated_params, updated_square_avg
+
+
 def rmsprop_init(params):
-    return {k: torch.zeros_like(p) for k, p in params.items()}  # square averages
+    return [torch.zeros_like(p) for p in params]  # square averages
 
 def rmsprop(params, grads, square_avg, lr=0.01, alpha=0.99, eps=1e-8):
-    updated_params = {}
-    updated_square_avg = {}
-    for k in params.keys():
-        avg_new = alpha * square_avg[k] + (1 - alpha) * grads[k].pow(2)
-        updated_params[k] = params[k] - lr * grads[k] / (avg_new.sqrt() + eps)
-        updated_square_avg[k] = avg_new
+    updated_square_avg = [alpha * avg + (1 - alpha) * g.pow(2) for avg, g in zip(square_avg, grads)]
+    updated_params = [p - lr * g / (avg.sqrt() + eps)
+                      for p, g, avg in zip(params, grads, updated_square_avg)]
     return updated_params, updated_square_avg
 
 
 ##########
 # ADAM
 
+# # DICT VARIANT
+# def adam_init(params):
+#     return (
+#         {k: torch.zeros_like(p) for k, p in params.items()},  # m
+#         {k: torch.zeros_like(p) for k, p in params.items()},  # v
+#         0  # t
+#     )
+
+# def adam(params, grads, m, v, t, lr=0.001, betas=(0.9, 0.999), eps=1e-8):
+#     updated_params = {}
+#     updated_m = {}
+#     updated_v = {}
+#     t += 1
+#     for k in params.keys():
+#         m_new = betas[0] * m[k] + (1 - betas[0]) * grads[k]
+#         v_new = betas[1] * v[k] + (1 - betas[1]) * grads[k].pow(2)
+#         m_hat = m_new / (1 - betas[0]**t)
+#         v_hat = v_new / (1 - betas[1]**t)
+#         updated_params[k] = params[k] - lr * m_hat / (v_hat.sqrt() + eps)
+#         updated_m[k] = m_new
+#         updated_v[k] = v_new
+#     return updated_params, updated_m, updated_v, t
+
+
 def adam_init(params):
     return (
-        {k: torch.zeros_like(p) for k, p in params.items()},  # m
-        {k: torch.zeros_like(p) for k, p in params.items()},  # v
+        [torch.zeros_like(p) for p in params],  # m
+        [torch.zeros_like(p) for p in params],  # v
         0  # t
     )
 
 def adam(params, grads, m, v, t, lr=0.001, betas=(0.9, 0.999), eps=1e-8):
-    updated_params = {}
-    updated_m = {}
-    updated_v = {}
     t += 1
-    for k in params.keys():
-        m_new = betas[0] * m[k] + (1 - betas[0]) * grads[k]
-        v_new = betas[1] * v[k] + (1 - betas[1]) * grads[k].pow(2)
-        m_hat = m_new / (1 - betas[0]**t)
-        v_hat = v_new / (1 - betas[1]**t)
-        updated_params[k] = params[k] - lr * m_hat / (v_hat.sqrt() + eps)
-        updated_m[k] = m_new
-        updated_v[k] = v_new
+    updated_m = [betas[0] * m_i + (1 - betas[0]) * g
+                 for m_i, g in zip(m, grads)]
+    updated_v = [betas[1] * v_i + (1 - betas[1]) * g.pow(2)
+                 for v_i, g in zip(v, grads)]
+
+    m_hat = [m_i / (1 - betas[0]**t) for m_i in updated_m]
+    v_hat = [v_i / (1 - betas[1]**t) for v_i in updated_v]
+
+    updated_params = [p - lr * mh / (vh.sqrt() + eps)
+                      for p, mh, vh in zip(params, m_hat, v_hat)]
+
     return updated_params, updated_m, updated_v, t
 
 
@@ -295,7 +450,6 @@ def update_lors(
         assert lor_ix_spans.min() >= -1
         assert lor_ix_spans.max() <= hidden_states[-1].shape[1]
 
-
         parses = select_spans(h_emb, lor_ix_spans)
 
         # no parses implied anywhere
@@ -308,10 +462,9 @@ def update_lors(
 
         # update cache
         for k, (l, r) in zip(lor_keys, proj_pairs):
-            # TODO: prob shouldnt require grads here
-            l = l.requires_grad_()
-            r = r.requires_grad_()
-
+            # # TODO: prob shouldnt require grads here
+            # l = l.requires_grad_()
+            # r = r.requires_grad_()
             if lor_cache[k][layer_ix] is None:  # is first pass, no cache yet
                 lor_cache[k][layer_ix] = (l.unsqueeze(2), r.unsqueeze(2))  # [B, DIM, RANK]
             else:
@@ -432,9 +585,38 @@ def apply_lor(x, lorl, lorr) -> torch.Tensor:
       lorr: [B, in_features, rank]
 
     '''
+
+    # print()  # DEBUG
+    # print(f"x range: {x.min().item():.3f} to {x.max().item():.3f}")  # DEBUG
+    # print(f"lorl range: {lorl.min().item():.3f} to {lorl.max().item():.3f}")  # DEBUG
+    # print(f"lorr range: {lorr.min().item():.3f} to {lorr.max().item():.3f}")  # DEBUG
+
     x = torch.einsum('bsd, bdr -> bsr', x, lorr)
     x = torch.einsum('bsr, bdr -> bsd', x, lorl)
     return x
+
+
+# def apply_lor(x, lorl, lorr) -> torch.Tensor:
+#     ''' Low rank "matrix" multiplication
+
+#     args:
+#       x: [B, S, D]
+#       lorl: [B, rank, out_features]
+#       lorr: [B, in_features, rank]
+
+#     '''
+
+#     mat = torch.einsum('bel, bdr -> bed', lorl, lorr)
+
+#     print()
+#     print(f"x range: {x.min().item():.3f} to {x.max().item():.3f}")
+#     print(f"lorl range: {lorl.min().item():.3f} to {lorl.max().item():.3f}")
+#     print(f"lorr range: {lorr.min().item():.3f} to {lorr.max().item():.3f}")
+#     print(f"mat range: {mat.min().item():.3f} to {mat.max().item():.3f}")
+
+
+#     y = torch.einsum('bed, bsd -> bse', mat, x)
+#     return y
 
 
 class LORProject(nn.Module):
@@ -514,10 +696,10 @@ class LORProject(nn.Module):
             'lor_os_r': nn.Linear(dim, dim, bias=False),
             'lor_gs_l': nn.Linear(dim, ff_dim, bias=False),
             'lor_gs_r': nn.Linear(dim, dim, bias=False),
-            # 'lor_us_l': nn.Linear(dim, ff_dim, bias=False),
+            'lor_us_l': nn.Linear(dim, ff_dim, bias=False),
             'lor_us_r': nn.Linear(dim, dim, bias=False),
             'lor_ds_l': nn.Linear(dim, dim, bias=False),
-            # 'lor_ds_r': nn.Linear(dim, ff_dim, bias=False),
+            'lor_ds_r': nn.Linear(dim, ff_dim, bias=False),
 
             # 'lor_us_l_ds_r': nn.Linear(dim, ff_dim, bias=False),
 
@@ -592,18 +774,132 @@ class LORProject(nn.Module):
             # ud_intermediate * -1,
             self.final_projections['lor_gs_r'](x[:, 9, :]),
             # self.final_projections['lor_us_l'](x[:, 10, :]),
-            ud_intermediate,
+            ud_intermediate,  # replace lor_us_l
             self.final_projections['lor_us_r'](x[:, 11, :]),
             self.final_projections['lor_ds_l'](x[:, 12, :]),
             # self.final_projections['lor_ds_r'](x[:, 13, :]),
-            ud_intermediate,
+            ud_intermediate,  # replace lor_ds_r
         )
 
         return outputs
 
+
+
+
+
+
+
+
+
+# class LORProject(nn.Module):
+#     def __init__(self, dropout_rate=0.2):
+#         super().__init__()
+
+#         # Keep the same dimension initialization
+#         dim = model.model.embed_tokens.weight.shape[1]  # embedding dimension
+#         k_dim = model.model.layers[0].self_attn.k_proj.weight.shape[0]
+#         v_dim = model.model.layers[0].self_attn.v_proj.weight.shape[0]
+#         ff_dim = model.config.intermediate_size
+
+#         self.dim = dim
+#         self.k_dim = k_dim
+#         self.v_dim = v_dim
+#         self.ff_dim = ff_dim
+
+#         # Input size is batch_size x N_METAWEIGHTS x dim
+#         input_size = N_METAWEIGHTS * dim
+#         hidden_size = 2048  # Can be tuned
+
+#         # Calculate total output size
+#         output_sizes = [
+#             dim, dim,    # lor_qs_l, lor_qs_r
+#             k_dim, dim,  # lor_ks_l, lor_ks_r
+#             v_dim, dim,  # lor_vs_l, lor_vs_r
+#             dim, dim,    # lor_os_l, lor_os_r
+#             ff_dim, dim, # lor_gs_l, lor_gs_r
+#             ff_dim, dim, # lor_us_l, lor_us_r
+#             dim, ff_dim  # lor_ds_l, lor_ds_r
+#         ]
+#         total_output_size = sum(output_sizes)
+
+#         # Simple 2-layer MLP
+#         self.mlp = nn.Sequential(
+#             nn.LayerNorm(input_size),
+#             nn.Linear(input_size, hidden_size, bias=False),
+#             nn.GELU(),
+#             nn.Dropout(dropout_rate),
+#             nn.Linear(hidden_size, total_output_size, bias=False),
+#             nn.Dropout(dropout_rate)
+#         )
+
+#         # Store output sizes for splitting
+#         self.output_sizes = output_sizes
+
+#     def forward(self, x):
+#         """
+#         x: [B, N_METAWEIGHTS, D]
+#         Returns: tuple of 14 tensors with appropriate shapes
+#         """
+#         B = x.shape[0]
+
+#         # Flatten input
+#         x_flat = x.reshape(B, -1)
+
+#         # Pass through MLP
+#         output = self.mlp(x_flat)
+
+#         # Split output into appropriate sizes
+#         outputs = []
+#         start_idx = 0
+
+#         for size in self.output_sizes:
+#             end_idx = start_idx + size
+#             out_piece = output[:, start_idx:end_idx]
+#             outputs.append(out_piece)
+#             start_idx = end_idx
+
+#         # Handle the tied intermediate state for ud_intermediate
+#         ud_intermediate = outputs[10]  # Use the lor_us_l output as ud_intermediate
+
+#         # Replace appropriate outputs with ud_intermediate
+#         final_outputs = (
+#             outputs[0],  # lor_qs_l
+#             outputs[1],  # lor_qs_r
+#             outputs[2],  # lor_ks_l
+#             outputs[3],  # lor_ks_r
+#             outputs[4],  # lor_vs_l
+#             outputs[5],  # lor_vs_r
+#             outputs[6],  # lor_os_l
+#             outputs[7],  # lor_os_r
+#             outputs[8],  # lor_gs_l
+#             outputs[9],  # lor_gs_r
+#             ud_intermediate,  # replace lor_us_l
+#             outputs[11],  # lor_us_r
+#             outputs[12],  # lor_ds_l
+#             ud_intermediate,  # replace lor_ds_r
+#         )
+
+#         return final_outputs
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class LORNorm(nn.Module):
-    def __init__(self, in_dim, out_dim):
+    def __init__(self, in_dim, out_dim, name):
         super().__init__()
+
+        self.name = name
 
         self.norm = nn.RMSNorm(out_dim)
 
@@ -643,9 +939,9 @@ class LORNorm(nn.Module):
           hidden_state: hidden_state at this layer, that projects through this layer's associated linear QKVOGUD block, and will be used to project through the LoR version too.
 
         '''
-
         if lor_cache is not None:
             lorl, lorr = lor_cache
+            # print(f'name: {self.name}') # DEBUG
             l = apply_lor(hidden_state, lorl, lorr)
             # return self.norm(original + l * self.scale)  # TODO: revisit if `scale` is good
             return self.norm(original + l)
@@ -656,87 +952,6 @@ class LORNorm(nn.Module):
 
 ##################################################
 # Training
-
-def run_epoch(model, dataloader, optimizer, device, train=True):
-    model.train() if train else model.eval()
-    total_loss = 0
-    total_samples = 0
-
-    with torch.set_grad_enabled(train):
-        for batch in tqdm(dataloader, desc="Training" if train else "Evaluating"):
-
-            # batch (Tuple[List[Tuple[torch.Tensor, torch.Tensor]], List[Tuple[torch.Tensor, torch.Tensor]]]):
-            #     A batch containing a single task, where:
-            #     - The first element is the support set: a list of N*k tuples, each containing
-            #       (batched_image, batched_label) for support examples.
-            #     - The second element is the query set: a list of N*q tuples, each containing
-            #       (batched_image, batched_label) for query examples.
-
-            # (Pdb) type(batch)
-            # <class 'list'>
-            # (Pdb) len(batch)
-            # 2
-            # (Pdb) type(batch[0])
-            # <class 'list'>
-            # (Pdb) len(batch[0])
-            # 5
-            # (Pdb) type(batch[0][0])
-            # <class 'list'>
-            # (Pdb) len(batch[0][0])
-            # 2
-            # (Pdb) batch[0][0][0].shape
-            # torch.Size([32, 28, 28])
-            # (Pdb) batch[0][0][1].shape
-            # torch.Size([32])
-
-
-            # supports: N*k tuples
-            # queries: N queries (or N*q if multiple queries)
-            supports, queries = batch
-            support_imgs = [x[0].to(device).unsqueeze(1) for x in supports]  # N*k tensors, shape=[B, 1, IMG_SIZE, IMG_SIZE]
-            support_labels = [x[1].to(device) for x in supports]  # N*k tensors, shape=[B]
-            query_imgs = [x[0].to(device).unsqueeze(1) for x in queries]  # N*k tensors, shape=[B, 1, IMG_SIZE, IMG_SIZE]
-            query_labels = [x[1].to(device) for x in queries]  # N*k tensors, shape=[B]
-            B = query_labels[0].shape[0]  # batch size
-
-            #####
-            # Go
-
-            loss = 0
-            for img, target_label in zip(support_imgs + query_imgs, support_labels + query_labels):
-                output_labels = model(img)
-                loss = loss + F.cross_entropy(output_labels, target_label)
-
-            loss = loss / (len(support_imgs) + len(query_imgs))
-
-            if train:
-                optimizer.zero_grad()
-                loss.backward()
-
-                # Grad clip
-                MAX_GRAD_NORM = 1.0
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=MAX_GRAD_NORM)
-
-                optimizer.step()
-
-            total_loss += loss.item() * B
-            total_samples += B
-
-    avg_loss = total_loss / total_samples
-
-    # Log weight histogram
-    if LOG and train:
-        try:
-            # for name, param in itertools.chain(model.named_parameters(), lor_models.named_parameters()):
-            for name, param in model.named_parameters():
-                if param.requires_grad:
-                    writer.add_histogram(f'weights/{name}', param.data.detach().to(dtype=torch.float32).cpu().numpy(), global_epoch)
-                    if param.grad is not None:
-                        writer.add_histogram(f'grads/{name}', param.grad.data.detach().to(dtype=torch.float32).cpu().numpy(), global_epoch)
-        except Exception as e:
-            warnings.warn(f'Failed to write to tensorboard: {e}')
-
-    return avg_loss
 
 
 def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, device, train=True, debug=False):
@@ -785,34 +1000,34 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
             support_labels = torch.stack([x[1].to(device) for x in supports], dim=1)  # N*k tensors, shape=[B] -> [B, N*k]
             query_imgs = img_proj(torch.stack([x[0].to(device).flatten(start_dim=1, end_dim=2) for x in queries], dim=1))  # N*k tensors [B, IMG, IMG] -> [B, N*k, D]
             query_labels = torch.stack([x[1].to(device) for x in queries], dim=1)  # N*k tensors, shape=[B] -> [B, N*k]
-            B, S = query_labels.shape  # batch size, sequence (N*k)
 
-            empty_lor_cache = empty_lors(model.config.num_hidden_layers)  # init lors for whole batch
+            B, Ss = support_labels.shape  # batch size, sequence (N*k)
+            Sq = query_labels.shape[1]  # N*q
 
+
+            # EXPERIMENT: random metaweights
             metaweights = torch.randn(B, N_METAWEIGHTS, D, device=device) * 1e-3  # TODO: what should this init be?
-            inputs_embeds = torch.cat([
-                support_imgs,
-                metaweights], dim=1)
 
-            img_attention_mask = torch.ones((B, S), device=device, dtype=torch.long)
+            # # EXPERIMENT: tokens for metaweights
+            # metatokens = torch.tensor(list(range(50, 64)), device=device, dtype=torch.long)
+            # metaweights = model.model.embed_tokens(metatokens).unsqueeze(0).repeat(B, 1, 1)
+
+            img_attention_mask = torch.ones((B, Ss), device=device, dtype=torch.long)
+            img_uncausal_mask = torch.ones_like(img_attention_mask, dtype=torch.bool)  # NOTE: whole sequence is uncausally masked
+
             meta_attention_mask = torch.ones((B, N_METAWEIGHTS), device=device, dtype=torch.long)
-            attention_mask = torch.cat([
-                img_attention_mask,
-                meta_attention_mask
-            ], dim=1)
+            meta_uncausal_mask = torch.ones_like(meta_attention_mask, dtype=torch.bool)
 
-            uncausal_mask = torch.cat([
-                torch.ones_like(img_attention_mask, dtype=torch.bool),  # NOTE: whole sequence is uncausally masked
-                torch.ones_like(meta_attention_mask, dtype=torch.bool)
-            ], dim=1)
+            query_attention_mask = torch.ones((B, Sq), device=device, dtype=torch.long)
+            query_uncausal_mask = torch.ones_like(query_attention_mask, dtype=torch.bool)
 
 
             # span ixs of metaweights to parse out (inclusive span). currently
             # lor_ixs is only defined for LOR_LAYER, other spans are None.
             lor_ixs = torch.zeros(B, 2, dtype=torch.long, device=device)
             with torch.no_grad():
-                lor_ixs[:, 0] = S
-                lor_ixs[:, 1] = S + N_METAWEIGHTS - 1
+                lor_ixs[:, 0] = Ss
+                lor_ixs[:, 1] = Ss + N_METAWEIGHTS - 1
 
             lor_ixs_per_layer = (
                 [None] * LOR_LAYER +
@@ -822,75 +1037,142 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
 
             #####
             # Run supports and metaweights to populate lor_cache
-            lor_cache = empty_lor_cache
+
 
             # iterate over supports and do SGD on LoRs
+
+            N_LOOPS = 20
             with torch.enable_grad():
-                for i in range(2):
+                opt_state = None  # will set first time this is needed
 
-                    if i > 0:
-                        lorm = partially_apply_models(lor_models, lor_cache)
-                    else:
-                        lorm = lor_cache  # ie empty
+                # First pass to collect LORS
+                # print(f'{support_imgs.norm().item()=}')
+                # print(f'{ metaweights.norm().item()=}')
+                empty_lor_cache = empty_lors(model.config.num_hidden_layers)  # init lors for whole batch
+                out = model(inputs_embeds=torch.cat([support_imgs, metaweights], dim=1),  # note: input_embeds, not input_ids
+                            attention_mask=torch.cat([img_attention_mask, meta_attention_mask], dim=1),
+                            return_dict=True,
+                            output_hidden_states=True,
+                            uncausal_mask=torch.cat([img_uncausal_mask, meta_uncausal_mask], dim=1),
+                            **empty_lor_cache,
+                            )
+                lor_cache = update_lors(lor_models, empty_lor_cache, lor_ixs_per_layer, out.hidden_states, num_layers)
 
-                    out = model(inputs_embeds=inputs_embeds,  # note: input_embeds, not input_ids
-                                attention_mask=attention_mask,
+                # N steps of metalearning
+                for i in range(N_LOOPS):
+                    # print(f'loop: {i}')  # DEBUG
+                    # make sure lors require grads
+                    for k in lor_cache.keys():
+                        for lix in range(len(lor_cache[k])):
+                            if lor_cache[k][lix] is not None:
+                                lor_cache[k][lix] = [lor_cache[k][lix][0].requires_grad_(), lor_cache[k][lix][1].requires_grad_()]
+
+                    lorm = partially_apply_models(lor_models, lor_cache)
+
+                    # Second pass to train LORS
+                    # print(f'{support_imgs.norm().item()=}')
+                    out = model(inputs_embeds=support_imgs,  # note: input_embeds, not input_ids
+                                attention_mask=img_attention_mask,
                                 return_dict=True,
                                 output_hidden_states=True,
-                                uncausal_mask=uncausal_mask,
+                                uncausal_mask=img_uncausal_mask,
                                 **lorm,
                                 )
 
                     # calculate TRANSDUCTIVE loss, ie not autoregressive, ie don't offset logits/targets (and don't causal mask)
-                    logits = out.logits[:, :S].contiguous().view(-1, vocab_size)  # note: not offset
-                    target = support_labels[:, :S].view(-1)
+                    logits = out.logits.contiguous().view(-1, vocab_size)  # note: not offset. just parses out img responses (not metaweights)
+                    target = support_labels.view(-1)
                     loss = F.cross_entropy(logits, target)
 
-                    # Metalearn
-                    if i > 0:
-                        key_ixs = []  # [(lor_key, layer_ix)]
-                        params = []
-                        # flatten params to be used in optim
-                        for k in lor_cache.keys():
-                            for lix in range(len(lor_cache[k])):
-                                if lor_cache[k][lix] is not None:
-                                    for tuple_ix in range(2):
-                                        key_ixs.append((k, lix, tuple_ix))
-                                        params.append(lor_cache[k][lix][tuple_ix].requires_grad_())
+                    key_ixs = []  # [(lor_key, layer_ix)]
+                    params = []
+                    # flatten params to be used in optim
+                    for k in lor_cache.keys():
+                        for lix in range(len(lor_cache[k])):
+                            if lor_cache[k][lix] is not None:
+                                for tuple_ix in range(2):
+                                    key_ixs.append((k, lix, tuple_ix))
+                                    params.append(lor_cache[k][lix][tuple_ix].requires_grad_())
 
-                        grads = torch.autograd.grad(loss, params, create_graph=True)
+                    grads = torch.autograd.grad(loss, params, create_graph=True)
+                    # print([f'{x.norm().item() * 1_000_000:>.1f}' for x in grads])
 
-                        new_params = sgd(params, grads, lr=inner_lr)
+                    MAX_GRAD_NORM = 1.0
+                    grads = [g.renorm(2, dim=-1, maxnorm=MAX_GRAD_NORM) for g in grads]
 
-                        lor_cache = empty_lors(model.config.num_hidden_layers)
-                        for (k, lix, tuple_ix), p in zip(key_ixs, new_params):
-                            if lor_cache[k][lix] is None:
-                                lor_cache[k][lix] = [None, None]  # these will both be filled in
-                            lor_cache[k][lix][tuple_ix] = p
 
-                    # replace current lors with new lors by updating over a fresh empty cache, instead of appending successively higher ranks
-                    lor_cache = update_lors(lor_models, empty_lor_cache, lor_ixs_per_layer, out.hidden_states, num_layers)
+                    if i == N_LOOPS - 1:
+                        print(f'iloss: {loss.item():>.6f}')
+
+                    if opt_state is None:
+                        opt_state = sgd_momentum_init(params)
+                        # opt_state = rmsprop_init(params)
+                        # opt_state = adam_init(params)
+                        pass
+
+                    # new_params = sgd(params, grads, lr=inner_lr)
+                    new_params, opt_state = sgd_momentum(params, grads, opt_state, lr=inner_lr)
+                    # new_params, opt_state = rmsprop(params, grads, opt_state, lr=inner_lr)
+                    # new_params, *opt_state = adam(params, grads, *opt_state, lr=inner_lr)
+
+                    lor_cache = empty_lors(model.config.num_hidden_layers)
+                    for (k, lix, tuple_ix), p in zip(key_ixs, new_params):
+                        if lor_cache[k][lix] is None:
+                            lor_cache[k][lix] = [None, None]  # these will both be filled in
+                        lor_cache[k][lix][tuple_ix] = p
+
+
 
 
 
             # #####
-            # # Run Challenge with lor_cache, but no attention to original inputs (answers must live in weights ie lor_cache)
-            # breakpoint()
+            # # QUERY with lor_cache, but no attention to original inputs (answers must live in weights ie lor_cache)
+
             # lorm = partially_apply_models(lor_models, lor_cache)
 
-            # challenge_out = model(
-            #     input_ids=challenge_input_ids,
-            #     attention_mask=challenge_attention_mask,
+            # SQ = query_imgs.shape[1]
+            # q_attention_mask = torch.ones(B, SQ, device=device, dtype=torch.long)
+            # query_out = model(
+            #     inputs_embeds=query_imgs,
+            #     attention_mask=q_attention_mask,
             #     **lorm,
             # )
 
+            # logits = query_out.logits[:, :-1].contiguous().view(-1, vocab_size)  # [B, S-1, D] -> [B * (S-1), D]
+            # target = query_labels[:, 1:].contiguous().view(-1)  # [B, S-1] -> [B * (S-1)]
+            # qloss = F.cross_entropy(logits, target)
 
-            # m = challenge_loss_mask[..., 1:].contiguous().view(-1)
+            # # final metalearning loss + query loss
+            # loss = loss + qloss
 
-            # vocab_size = challenge_out.logits.shape[2]
-            # logits = challenge_out.logits[:, :-1].contiguous().view(-1, vocab_size)  # [B, S-1, D] -> [B * (S-1), D]
-            # target = challenge_input_ids[:, 1:].contiguous().view(-1)  # [B, S-1] -> [B * (S-1)]
-            # loss = F.cross_entropy(logits[m], target[m])
+
+            # #####
+            # # SHAM QUERY, re-run support for final loss
+
+            # lorm = partially_apply_models(lor_models, lor_cache)
+
+            # SS = support_imgs.shape[1]
+            # s_attention_mask = torch.ones(B, SS, device=device, dtype=torch.long)
+
+            # query_out = model(
+            #     inputs_embeds=support_imgs,
+            #     attention_mask=s_attention_mask,
+
+            #     # inputs_embeds=inputs_embeds,
+            #     # attention_mask=img_attention_mask,
+            #     # uncausal_mask=uncausal_mask,
+
+            #     **lorm,
+            # )
+
+            # logits = query_out.logits[:, :S].contiguous().view(-1, vocab_size)  # [B, S-1, D] -> [B * (S-1), D]
+            # target = support_labels.contiguous().view(-1)  # [B, S-1] -> [B * (S-1)]
+            # qloss = F.cross_entropy(logits, target)
+
+            # # final metalearning loss + query loss
+            # # loss = loss + qloss
+            # loss = qloss
+
 
             if torch.isnan(loss):
                 print('NaN encountered:')
@@ -906,6 +1188,16 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
                 MAX_GRAD_NORM = 1.0
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=MAX_GRAD_NORM)
                 nn.utils.clip_grad_norm_(lor_models.parameters(), max_norm=MAX_GRAD_NORM)
+                nn.utils.clip_grad_norm_(img_proj.parameters(), max_norm=MAX_GRAD_NORM)
+
+
+
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+                        if grad_norm > 100:
+                            print(f"Large gradient in {name}: {grad_norm}")
+
 
                 optimizer.step()
 
@@ -944,7 +1236,7 @@ global_epoch = 0
 train_alphabets = ["Latin", "Greek"]
 test_alphabets = ["Mongolian"]
 img_size = 28
-n_way = 5  # N-way classification
+n_way = 2  # N-way classification
 k_shot = 1  # k-shot learning
 q_query = 1  # query examples per class
 num_tasks = 100  # number of tasks per epoch
@@ -952,10 +1244,10 @@ num_tasks = 100  # number of tasks per epoch
 # training
 num_epochs = 100
 batch_size = 32
-lr = 1e-3
+lr = 1e-4
 wd = 1e-2
 
-inner_lr = 1e-2
+inner_lr = 1.0  # SGD-momentum needs much higher lr
 
 
 ##########
@@ -993,18 +1285,18 @@ lor_models = nn.ModuleDict(
 lor_models['lor_proj'][LOR_LAYER] = LORProject()
 
 if WHICH_LOR == 1:
-    lor_models['lor_qs'][LOR_LAYER] = LORNorm(dim, dim)
-    lor_models['lor_ks'][LOR_LAYER] = LORNorm(dim, k_dim)
-    lor_models['lor_vs'][LOR_LAYER] = LORNorm(dim, v_dim)
-    lor_models['lor_os'][LOR_LAYER] = LORNorm(dim, dim)
+    lor_models['lor_qs'][LOR_LAYER] = LORNorm(dim, dim, name='lor_qs')
+    lor_models['lor_ks'][LOR_LAYER] = LORNorm(dim, k_dim, name='lor_ks')
+    lor_models['lor_vs'][LOR_LAYER] = LORNorm(dim, v_dim, name='lor_vs')
+    lor_models['lor_os'][LOR_LAYER] = LORNorm(dim, dim, name='lor_os')
 
-    lor_models['lor_gs'][LOR_LAYER] = LORNorm(dim, ff_dim)
-    lor_models['lor_us'][LOR_LAYER] = LORNorm(dim, ff_dim)
-    lor_models['lor_ds'][LOR_LAYER] = LORNorm(dim, dim)
+    lor_models['lor_gs'][LOR_LAYER] = LORNorm(dim, ff_dim, name='lor_gs')
+    lor_models['lor_us'][LOR_LAYER] = LORNorm(dim, ff_dim, name='lor_us')
+    lor_models['lor_ds'][LOR_LAYER] = LORNorm(dim, dim, name='lor_ds')
 elif WHICH_LOR == 2:
-    lor_models['lor_gs'][LOR_LAYER] = LORNorm(dim, ff_dim)
-    lor_models['lor_us'][LOR_LAYER] = LORNorm(dim, ff_dim)
-    lor_models['lor_ds'][LOR_LAYER] = LORNorm(dim, dim)
+    lor_models['lor_gs'][LOR_LAYER] = LORNorm(dim, ff_dim, name='lor_gs')
+    lor_models['lor_us'][LOR_LAYER] = LORNorm(dim, ff_dim, name='lor_us')
+    lor_models['lor_ds'][LOR_LAYER] = LORNorm(dim, dim, name='lor_ds')
 lor_models = lor_models.to(DEVICE, dtype=model.dtype)
 
 
@@ -1015,7 +1307,14 @@ add_hooks(lor_models)
 ##########
 # Image Projection
 
-img_proj = nn.Linear(img_size ** 2, dim)
+img_proj = nn.Sequential(
+    nn.Linear(img_size ** 2, dim),
+    nn.LayerNorm(dim)
+)
+with torch.no_grad():
+    assert isinstance(img_proj[1], nn.LayerNorm)
+    img_proj[1].weight[:] = torch.ones_like(img_proj[1].weight) * 1e-1
+
 img_proj.to(DEVICE)
 
 ##########
@@ -1032,20 +1331,89 @@ train_dl, test_dl = omniglot_n_way_k_shot(
     batch_size,
 )
 
+
+#####
+# Check Data
+
+if False:
+    # START_BLOCK_1
+
+    # Explore Data
+    for batch in train_dl:
+        supports, queries = batch
+        support_imgs = torch.stack([x[0].to(DEVICE).flatten(start_dim=1, end_dim=2) for x in supports], dim=1)  # N*k tensors [B, IMG, IMG]
+        support_labels = torch.stack([x[1].to(DEVICE) for x in supports], dim=1)  # N*k tensors, shape=[B] -> [B, N*k]
+        query_imgs = torch.stack([x[0].to(DEVICE).flatten(start_dim=1, end_dim=2) for x in queries], dim=1)  # N*k tensors [B, IMG, IMG]
+        query_labels = torch.stack([x[1].to(DEVICE) for x in queries], dim=1)  # N*k tensors, shape=[B] -> [B, N*k]
+        break
+
+
+
+    # We'll visualize the first batch only
+    batch_idx = 0
+
+    # Calculate image size (assuming square images)
+    img_size = int(np.sqrt(support_imgs.shape[-1]))
+
+    # Create a figure with a grid: k_shot + 1 rows (support + query) x n_way columns
+    fig, axes = plt.subplots(k_shot + 1, n_way, figsize=(12, 10))
+    plt.subplots_adjust(hspace=0.5)
+
+    # Plot support images
+    for i in range(k_shot):
+        for j in range(n_way):
+            idx = i * n_way + j
+            img = support_imgs[batch_idx, idx].cpu().numpy().reshape(img_size, img_size)
+            label = support_labels[batch_idx, idx].cpu().numpy()
+
+            axes[i, j].imshow(img, cmap='gray')
+            axes[i, j].axis('off')
+            axes[i, j].set_title(f'Class {label}')
+
+    # Plot query images
+    for j in range(n_way):
+        img = query_imgs[batch_idx, j].cpu().numpy().reshape(img_size, img_size)
+        label = query_labels[batch_idx, j].cpu().numpy()
+
+        axes[-1, j].imshow(img, cmap='gray')
+        axes[-1, j].axis('off')
+        axes[-1, j].set_title(f'Query\nClass {label}')
+
+    # Add row labels
+    for i in range(k_shot):
+        axes[i, 0].set_ylabel(f'Support\nSet {i+1}', rotation=0, labelpad=40)
+    axes[-1, 0].set_ylabel('Query\nSet', rotation=0, labelpad=40)
+
+    plt.suptitle('Omniglot Few-Shot Learning Task Visualization\n'
+                f'{n_way}-way {k_shot}-shot with 1 query example per class',
+                y=1.02)
+    plt.tight_layout()
+
+    plt.show()
+
+    # END_BLOCK_1
+
+
+
+
 ##########
 # Optimizer
 
-parameters = [{
+parameters = [
+
+{
     'params': model.parameters(),
-    'lr': 0.0,
+    'lr': 1e-5,
     'wd': 0.0
 },
-    {
+
+{
     'params': img_proj.parameters(),
     'lr': lr,
     'wd': wd
 },
-    {
+
+{
     'params': lor_models.parameters(),
     'lr': lr,
     'wd': wd
@@ -1063,15 +1431,17 @@ best_loss = float('inf')
 model.train()
 for epoch in range(num_epochs):
     global_epoch += 1
-    train_loss = run_epoch(model, img_proj, lor_models, inner_lr, train_dl, optimizer, DEVICE, train=True)
-    train_losses.append(train_loss)
-    writer.add_scalars('loss', {'train': train_loss}, global_epoch)
 
-    if epoch % 1 == 0:
+    # with torch.autograd.detect_anomaly():
+    train_loss = run_epoch(model, img_proj, lor_models, inner_lr, train_dl, optimizer, DEVICE, train=True)
+
+    train_losses.append(train_loss)
+    if LOG: writer.add_scalars('loss', {'train': train_loss}, global_epoch)
+
+    if epoch % 5 == 0:
         test_loss = run_epoch(model, img_proj, lor_models, inner_lr, test_dl, optimizer, DEVICE, train=False)
-        # test_loss = 0
         test_losses.append(test_loss)
-        writer.add_scalars('loss', {'test': test_loss}, global_epoch)
+        if LOG: writer.add_scalars('loss', {'test': test_loss}, global_epoch)
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}")
     else:
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}")

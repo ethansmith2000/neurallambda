@@ -333,7 +333,7 @@ class Qwen2DecoderLayer(nn.Module):
     def __init__(self, config: Q.Qwen2Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
+        self.layer_idx = layer_idx
         if config.sliding_window and config._attn_implementation != "flash_attention_2":
             Q.logger.warning_once(
                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
@@ -388,6 +388,7 @@ class Qwen2DecoderLayer(nn.Module):
 
         residual = hidden_states
 
+        # print('layer_idx: ', self.layer_idx, f'{hidden_states.norm().item()=}')
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
@@ -578,6 +579,7 @@ class Qwen2Model(Q.Qwen2PreTrainedModel):
                     lor_d=lor_d,
                 )
             else:
+                # print(f'model hidden states: {hidden_states.norm().item()=}')
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
