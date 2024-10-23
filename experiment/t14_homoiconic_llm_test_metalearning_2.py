@@ -36,14 +36,26 @@ PROVENANCE:
 NaN ISSUES:
 - rmsprop and adam have issues during the backward pass of the outerloop, and throw NaNs (at least I think this is where the NaNs are coming from. NaNs show up in weights after outer loop, so immediately bork the next fwd pass)
 
+
 SPEEDING UP ITERATION:
 - truncating model
 - smaller N classes helps speed up iteration
 - turn off tensorboard logging
 
+
 STABILIZATION:
 - sgd_momentum, lr=1.0, N_LOOP=20
 - rmsprop and adam NaN issue
+- rm Dropout in LORProject, helped a ton (DID IT?)
+- randn up-down random intermediate seems important. Without, i can reach "better than chance" but even that's unstable. Using a projection instead of randn seems ok; starts off way worse so init matters, and is less stable.
+- LORNorm: small init (normal_init * 1e-2) for RMSNorm helps a lot
+
+DESIGN CHOICES:
+- MLPMixer (rm dropout. intermediate size?. residuals? act fn? RMSNorm?)
+- randn ud_intermediate in MLPMixer
+- hyperparams (lr, wd, frozen params)
+- metatokens as randn?  (embeddings seem to help, maybe)
+- feedback updated metaweights each inner loop?
 
 
 TODO:
@@ -254,11 +266,6 @@ num_layers = model.config.num_hidden_layers
 print_model_info(model)
 
 
-
-
-
-
-
 ##################################################
 # Functional Optimizers
 #
@@ -269,8 +276,6 @@ print_model_info(model)
 # SGD
 
 def sgd(params, grads, lr=0.01):
-    # # structured dict variant
-    # return {k: p - grads[k] * lr for k, p in params.items()}
     return [p - g * lr for p, g in zip(params, grads)]
 
 
@@ -293,25 +298,9 @@ def rmsprop_init(params):
     return [torch.zeros_like(p) for p in params]  # square averages
 
 def rmsprop(params, grads, square_avg, lr=0.01, alpha=0.99, eps=1e-8):
-
-    for p, g in zip(params, grads):
-        if p.isnan().any() or g.isnan().any() or p.isinf().any() or g.isinf().any():
-            print('FIRST')
-            print(f'{p.isnan().any()=},  {g.isnan().any()=}, {p.isinf().any()=}, {g.isinf().any()=}')
-            breakpoint()
-
-
     updated_square_avg = [alpha * avg + (1 - alpha) * g.pow(2) for avg, g in zip(square_avg, grads)]
     updated_params = [p - lr * g / (avg.sqrt() + eps)
                       for p, g, avg in zip(params, grads, updated_square_avg)]
-
-
-    for p, g in zip(params, grads):
-        if p.isnan().any() or g.isnan().any() or p.isinf().any() or g.isinf().any():
-            print('SECOND')
-            print(f'{p.isnan().any()=},  {g.isnan().any()=}, {p.isinf().any()=}, {g.isinf().any()=}')
-            breakpoint()
-
     return updated_params, updated_square_avg
 
 
@@ -483,9 +472,6 @@ def update_lors(
 
         # update cache
         for k, (l, r) in zip(lor_keys, proj_pairs):
-            # # TODO: prob shouldnt require grads here
-            # l = l.requires_grad_()
-            # r = r.requires_grad_()
             if lor_cache[k][layer_ix] is None:  # is first pass, no cache yet
                 lor_cache[k][layer_ix] = (l.unsqueeze(2), r.unsqueeze(2))  # [B, DIM, RANK]
             else:
@@ -606,38 +592,9 @@ def apply_lor(x, lorl, lorr) -> torch.Tensor:
       lorr: [B, in_features, rank]
 
     '''
-
-    # print()  # DEBUG
-    # print(f"x range: {x.min().item():.3f} to {x.max().item():.3f}")  # DEBUG
-    # print(f"lorl range: {lorl.min().item():.3f} to {lorl.max().item():.3f}")  # DEBUG
-    # print(f"lorr range: {lorr.min().item():.3f} to {lorr.max().item():.3f}")  # DEBUG
-
     x = torch.einsum('bsd, bdr -> bsr', x, lorr)
     x = torch.einsum('bsr, bdr -> bsd', x, lorl)
     return x
-
-
-# def apply_lor(x, lorl, lorr) -> torch.Tensor:
-#     ''' Low rank "matrix" multiplication
-
-#     args:
-#       x: [B, S, D]
-#       lorl: [B, rank, out_features]
-#       lorr: [B, in_features, rank]
-
-#     '''
-
-#     mat = torch.einsum('bel, bdr -> bed', lorl, lorr)
-
-#     print()
-#     print(f"x range: {x.min().item():.3f} to {x.max().item():.3f}")
-#     print(f"lorl range: {lorl.min().item():.3f} to {lorl.max().item():.3f}")
-#     print(f"lorr range: {lorr.min().item():.3f} to {lorr.max().item():.3f}")
-#     print(f"mat range: {mat.min().item():.3f} to {mat.max().item():.3f}")
-
-
-#     y = torch.einsum('bed, bsd -> bse', mat, x)
-#     return y
 
 
 class LORProject(nn.Module):
@@ -656,7 +613,7 @@ class LORProject(nn.Module):
 
     '''
 
-    def __init__(self, dropout_rate=0.2):
+    def __init__(self, dropout_rate=0.15):
         super().__init__()
 
         dim = model.model.embed_tokens.weight.shape[1]  # embedding dimension
@@ -692,7 +649,7 @@ class LORProject(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout_rate),
             nn.Linear(self.token_mixing_dim, n_out, bias=False),
-            nn.Dropout(dropout_rate)
+            nn.Dropout(dropout_rate),
         )
 
         # Channel-mixing MLP (same for all inputs)
@@ -702,7 +659,7 @@ class LORProject(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout_rate),
             nn.Linear(self.channel_mixing_dim, dim, bias=False),
-            nn.Dropout(dropout_rate)
+            nn.Dropout(dropout_rate),
         )
 
         # Final projection layers
@@ -717,10 +674,10 @@ class LORProject(nn.Module):
             'lor_os_r': nn.Linear(dim, dim, bias=False),
             'lor_gs_l': nn.Linear(dim, ff_dim, bias=False),
             'lor_gs_r': nn.Linear(dim, dim, bias=False),
-            'lor_us_l': nn.Linear(dim, ff_dim, bias=False),
+            # 'lor_us_l': nn.Linear(dim, ff_dim, bias=False),
             'lor_us_r': nn.Linear(dim, dim, bias=False),
             'lor_ds_l': nn.Linear(dim, dim, bias=False),
-            'lor_ds_r': nn.Linear(dim, ff_dim, bias=False),
+            # 'lor_ds_r': nn.Linear(dim, ff_dim, bias=False),
 
             # 'lor_us_l_ds_r': nn.Linear(dim, ff_dim, bias=False),
 
@@ -748,20 +705,21 @@ class LORProject(nn.Module):
         device = x.device
 
         # Token-mixing
-        residual = x
+        # residual = x
+
         # x_token shape: [batch, dim, 14]
         x_token = x.transpose(1, 2)
         # Normalize across token dimension
         x_token = self.token_mixing_mlp(x_token)
         x_token = x_token.transpose(1, 2)  # [batch, 14, dim]
 
-        # x = residual + x_token  # TODO: residuals off
+        # x = residual + x_token
 
         # Channel-mixing
-        residual = x
+        # residual = x
         x = self.channel_mixing_mlp(x)
 
-        # x = residual + x  # TODO: residuals off
+        # x = residual + x
 
         ##########
         # Original attempt
@@ -775,7 +733,8 @@ class LORProject(nn.Module):
         ##########
         # Tie intermediates. Adopting results from (ie, results from t14_homoiconic_llm_adding_data_to_mlp)
 
-        # ud_intermediate = self.final_projections['lor_us_l_ds_r']
+        # # Generated `ud_intermediate`
+        # ud_intermediate = self.final_projections['lor_us_l_ds_r'](x[:, 10])
 
 
         # NOTE: statistics of randn are likely way off
@@ -794,10 +753,13 @@ class LORProject(nn.Module):
             self.final_projections['lor_gs_l'](x[:, 8, :]),
             # ud_intermediate * -1,
             self.final_projections['lor_gs_r'](x[:, 9, :]),
+
             # self.final_projections['lor_us_l'](x[:, 10, :]),
             ud_intermediate,  # replace lor_us_l
+
             self.final_projections['lor_us_r'](x[:, 11, :]),
             self.final_projections['lor_ds_l'](x[:, 12, :]),
+
             # self.final_projections['lor_ds_r'](x[:, 13, :]),
             ud_intermediate,  # replace lor_ds_r
         )
@@ -880,7 +842,7 @@ class LORProject(nn.Module):
 #             start_idx = end_idx
 
 #         # Handle the tied intermediate state for ud_intermediate
-#         ud_intermediate = outputs[10]  # Use the lor_us_l output as ud_intermediate
+#         # ud_intermediate = outputs[10]  # Use the lor_us_l output as ud_intermediate
 
 #         # Replace appropriate outputs with ud_intermediate
 #         final_outputs = (
@@ -894,10 +856,15 @@ class LORProject(nn.Module):
 #             outputs[7],  # lor_os_r
 #             outputs[8],  # lor_gs_l
 #             outputs[9],  # lor_gs_r
-#             ud_intermediate,  # replace lor_us_l
+
+#             outputs[10],
+#             # ud_intermediate,  # replace lor_us_l
+
 #             outputs[11],  # lor_us_r
 #             outputs[12],  # lor_ds_l
-#             ud_intermediate,  # replace lor_ds_r
+
+#             outputs[13],
+#             # ud_intermediate,  # replace lor_ds_r
 #         )
 
 #         return final_outputs
@@ -1060,13 +1027,10 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
 
 
             # iterate over supports and do SGD on LoRs
-
             with torch.enable_grad():
                 opt_state = None  # will set first time this is needed
 
                 # First pass to collect LORS
-                # print(f'{support_imgs.norm().item()=}')
-                # print(f'{ metaweights.norm().item()=}')
                 empty_lor_cache = empty_lors(model.config.num_hidden_layers)  # init lors for whole batch
                 out = model(inputs_embeds=torch.cat([support_imgs, metaweights], dim=1),  # note: input_embeds, not input_ids
                             attention_mask=torch.cat([img_attention_mask, meta_attention_mask], dim=1),
@@ -1079,7 +1043,7 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
 
                 # N steps of metalearning
                 for i in range(N_LOOPS):
-                    # print(f'loop: {i}')  # DEBUG
+
                     # make sure lors require grads
                     for k in lor_cache.keys():
                         for lix in range(len(lor_cache[k])):
@@ -1089,7 +1053,6 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
                     lorm = partially_apply_models(lor_models, lor_cache)
 
                     # Second pass to train LORS
-                    # print(f'{support_imgs.norm().item()=}')
                     out = model(inputs_embeds=support_imgs,  # note: input_embeds, not input_ids
                                 attention_mask=img_attention_mask,
                                 return_dict=True,
@@ -1114,11 +1077,9 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
                                     params.append(lor_cache[k][lix][tuple_ix].requires_grad_())
 
                     grads = torch.autograd.grad(loss, params, create_graph=True)
-                    # print([f'{x.norm().item() * 1_000_000:>.1f}' for x in grads])
 
                     MAX_GRAD_NORM = 1.0
                     grads = [g.renorm(2, dim=-1, maxnorm=MAX_GRAD_NORM) for g in grads]
-
 
                     if i == N_LOOPS - 1:
                         print(f'iloss: {loss.item():>.6f}')
@@ -1221,14 +1182,11 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
                 nn.utils.clip_grad_norm_(lor_models.parameters(), max_norm=MAX_GRAD_NORM)
                 nn.utils.clip_grad_norm_(img_proj.parameters(), max_norm=MAX_GRAD_NORM)
 
-
-
                 for name, param in model.named_parameters():
                     if param.grad is not None:
                         grad_norm = param.grad.norm().item()
                         if grad_norm > 100:
                             print(f"Large gradient in {name}: {grad_norm}")
-
 
                 optimizer.step()
 
@@ -1277,7 +1235,6 @@ num_epochs = 100
 batch_size = 32
 lr = 1e-4
 wd = 1e-2
-
 
 # INNER_OPT = 'sgd'
 INNER_OPT = 'sgd_momentum'
@@ -1519,8 +1476,8 @@ if num_epochs > 0:
 
 
 
-
-
+##################################################
+# Analyze trained params
 
 for k in lor_models.keys():
     for lix in range(len(lor_models[k])):
@@ -1528,6 +1485,100 @@ for k in lor_models.keys():
             continue
         for n, p in lor_models[k][lix].named_parameters():
             print()
-            print(n)
+            print(f'{k} | {n}')
             xs = [f'{x:>.3f}' for x in p.flatten()[:10].tolist()]
             print(f'{p.min().item():>.3f}, {p.max().item():>.3f}, {p.mean().item():>.3f}, {p.std().item():>.3f}, {xs}')
+
+
+'''
+
+lor_proj | token_mixing_mlp.0.weight
+1.000, 1.000, 1.000, 0.000, ['1.000', '1.000', '1.000', '1.000', '1.000', '1.000', '1.000', '1.000', '1.000', '1.000']
+
+lor_proj | token_mixing_mlp.1.weight
+-0.267, 0.266, -0.002, 0.153, ['0.200', '-0.127', '-0.068', '0.026', '0.167', '0.043', '-0.109', '0.084', '-0.182', '-0.058']
+
+lor_proj | token_mixing_mlp.4.weight
+-0.088, 0.088, 0.001, 0.051, ['0.079', '-0.015', '-0.046', '-0.066', '-0.068', '-0.031', '-0.022', '-0.029', '-0.008', '-0.036']
+
+
+
+lor_proj | channel_mixing_mlp.0.weight
+0.997, 1.002, 1.000, 0.001, ['1.000', '1.000', '0.999', '0.999', '0.999', '0.998', '1.000', '0.999', '0.998', '0.999']
+
+lor_proj | channel_mixing_mlp.1.weight
+-0.036, 0.036, -0.000, 0.019, ['0.012', '0.012', '0.005', '0.004', '-0.022', '0.026', '0.032', '0.016', '-0.028', '-0.023']
+
+lor_proj | channel_mixing_mlp.4.weight
+-0.090, 0.090, 0.000, 0.051, ['-0.045', '-0.015', '-0.001', '-0.007', '-0.005', '0.068', '-0.049', '0.084', '0.028', '-0.019']
+
+
+
+lor_proj | final_projections.lor_qs_l.weight
+-0.033, 0.033, -0.000, 0.019, ['0.024', '-0.005', '-0.022', '0.033', '0.018', '-0.019', '-0.017', '0.031', '-0.021', '0.012']
+
+lor_proj | final_projections.lor_qs_r.weight
+-0.033, 0.033, -0.000, 0.019, ['0.011', '0.026', '-0.011', '0.030', '0.002', '-0.001', '-0.027', '0.011', '0.032', '-0.017']
+
+lor_proj | final_projections.lor_ks_l.weight
+-0.033, 0.033, 0.000, 0.019, ['-0.029', '-0.008', '0.025', '0.010', '0.022', '0.019', '0.028', '-0.006', '0.011', '0.023']
+
+lor_proj | final_projections.lor_ks_r.weight
+-0.033, 0.033, -0.000, 0.019, ['-0.000', '0.011', '-0.019', '0.032', '0.030', '0.020', '0.003', '-0.031', '-0.012', '-0.031']
+
+lor_proj | final_projections.lor_vs_l.weight
+-0.035, 0.035, -0.000, 0.019, ['-0.015', '0.016', '0.014', '-0.021', '-0.015', '-0.012', '-0.028', '0.030', '-0.021', '0.009']
+
+lor_proj | final_projections.lor_vs_r.weight
+-0.035, 0.035, -0.000, 0.019, ['0.025', '0.004', '-0.027', '-0.011', '0.011', '-0.022', '0.017', '-0.013', '0.001', '-0.029']
+
+lor_proj | final_projections.lor_os_l.weight
+-0.036, 0.037, -0.000, 0.019, ['-0.027', '0.023', '-0.030', '-0.030', '-0.031', '-0.016', '0.003', '0.014', '0.005', '0.010']
+
+lor_proj | final_projections.lor_os_r.weight
+-0.036, 0.036, -0.000, 0.019, ['-0.009', '-0.010', '0.001', '0.013', '-0.019', '0.030', '0.013', '0.005', '-0.032', '0.027']
+
+lor_proj | final_projections.lor_gs_l.weight
+-0.035, 0.035, -0.000, 0.019, ['-0.017', '0.004', '-0.004', '-0.026', '-0.021', '0.028', '0.032', '0.007', '0.031', '0.010']
+
+lor_proj | final_projections.lor_gs_r.weight
+-0.035, 0.035, 0.000, 0.019, ['-0.026', '-0.003', '-0.013', '0.017', '-0.001', '0.020', '-0.028', '0.029', '0.007', '0.006']
+
+lor_proj | final_projections.lor_us_l.weight
+-0.033, 0.033, -0.000, 0.019, ['-0.015', '0.001', '0.021', '0.033', '0.001', '0.014', '0.010', '-0.002', '0.033', '0.031']
+
+lor_proj | final_projections.lor_us_r.weight
+-0.035, 0.035, 0.000, 0.019, ['-0.025', '0.021', '0.025', '0.005', '0.006', '-0.012', '0.017', '-0.019', '-0.021', '-0.032']
+
+lor_proj | final_projections.lor_ds_l.weight
+-0.037, 0.037, -0.000, 0.019, ['0.011', '0.013', '0.019', '-0.018', '0.009', '-0.019', '-0.034', '0.017', '0.023', '0.015']
+
+lor_proj | final_projections.lor_ds_r.weight
+-0.033, 0.033, -0.000, 0.019, ['-0.021', '-0.021', '0.019', '-0.027', '-0.017', '-0.033', '-0.010', '0.010', '0.009', '-0.021']
+
+
+
+lor_qs | norm.weight
+0.009, 0.011, 0.010, 0.000, ['0.010', '0.010', '0.010', '0.010', '0.010', '0.010', '0.010', '0.010', '0.010', '0.010']
+
+lor_ks | norm.weight
+0.009, 0.011, 0.010, 0.000, ['0.010', '0.011', '0.011', '0.010', '0.010', '0.010', '0.010', '0.010', '0.010', '0.010']
+
+lor_vs | norm.weight
+0.008, 0.012, 0.010, 0.001, ['0.010', '0.009', '0.010', '0.010', '0.010', '0.011', '0.010', '0.010', '0.009', '0.011']
+
+lor_os | norm.weight
+0.009, 0.015, 0.012, 0.001, ['0.012', '0.010', '0.012', '0.013', '0.010', '0.013', '0.010', '0.014', '0.012', '0.014']
+
+lor_gs | norm.weight
+0.008, 0.013, 0.010, 0.001, ['0.011', '0.011', '0.009', '0.011', '0.011', '0.009', '0.011', '0.010', '0.011', '0.010']
+
+lor_us | norm.weight
+0.008, 0.013, 0.010, 0.001, ['0.011', '0.011', '0.009', '0.011', '0.011', '0.009', '0.011', '0.011', '0.011', '0.010']
+
+lor_ds | norm.weight
+0.009, 0.016, 0.012, 0.001, ['0.012', '0.012', '0.011', '0.011', '0.011', '0.012', '0.012', '0.014', '0.010', '0.014']
+
+
+
+'''
