@@ -53,10 +53,11 @@ STABILIZATION:
 DESIGN CHOICES:
 - MLPMixer (rm dropout. intermediate size?. residuals? act fn? RMSNorm?)
 - randn ud_intermediate in MLPMixer
+- randn kv_intermediate in MLPMixer
 - hyperparams (lr, wd, frozen params)
 - metatokens as randn?  (embeddings seem to help, maybe)
 - feedback updated metaweights each inner loop?
-
+- img_proj: architecture and init
 
 TODO:
 - [ ] fix run_epoch
@@ -73,6 +74,7 @@ TODO:
   2. [ ] use metalearned tokens in outerloop, and train entire model
 
 '''
+
 
 import os
 import sys
@@ -233,7 +235,6 @@ except:
 
     add_hooks(model)
     already_loaded = True
-
 
 
 if True:
@@ -722,160 +723,82 @@ class LORProject(nn.Module):
         # x = residual + x
 
         ##########
-        # Original attempt
-
-        # # Final projections to adjust dimensions
-        # outputs = []
-        # for i, proj in enumerate(self.final_projections.values()):
-        #     outputs.append(proj(x[:, i, :]))
-
-
-        ##########
         # Tie intermediates. Adopting results from (ie, results from t14_homoiconic_llm_adding_data_to_mlp)
 
         # # Generated `ud_intermediate`
         # ud_intermediate = self.final_projections['lor_us_l_ds_r'](x[:, 10])
 
+        # # NOTE: statistics of randn are likely way off
+        # # TODO: bc of this shrink, shrink token_mixing_mlp from dim=14 to dim=12, since those outputs go unused
+        # ud_intermediate = torch.randn(B, self.ff_dim, device=device)
+        # outputs = (
+        #     self.final_projections['lor_qs_l'](x[:, 0, :]),
+        #     self.final_projections['lor_qs_r'](x[:, 1, :]),
+        #     self.final_projections['lor_ks_l'](x[:, 2, :]),
+        #     self.final_projections['lor_ks_r'](x[:, 3, :]),
+        #     self.final_projections['lor_vs_l'](x[:, 4, :]),
+        #     self.final_projections['lor_vs_r'](x[:, 5, :]),
+        #     self.final_projections['lor_os_l'](x[:, 6, :]),
+        #     self.final_projections['lor_os_r'](x[:, 7, :]),
+        #     self.final_projections['lor_gs_l'](x[:, 8, :]),
+        #     # ud_intermediate * -1,
+        #     self.final_projections['lor_gs_r'](x[:, 9, :]),
 
-        # NOTE: statistics of randn are likely way off
-        # TODO: bc of this shrink, shrink token_mixing_mlp from dim=14 to dim=12, since those outputs go unused
+        #     # self.final_projections['lor_us_l'](x[:, 10, :]),
+        #     ud_intermediate,  # replace lor_us_l
+
+        #     self.final_projections['lor_us_r'](x[:, 11, :]),
+        #     self.final_projections['lor_ds_l'](x[:, 12, :]),
+
+        #     # self.final_projections['lor_ds_r'](x[:, 13, :]),
+        #     ud_intermediate,  # replace lor_ds_r
+        # )
+
+
         ud_intermediate = torch.randn(B, self.ff_dim, device=device)
+        kv_intermediate = torch.randn(B, self.k_dim, device=device)
+        ou_intermediate = torch.randn(B, self.dim, device=device)
 
         outputs = (
             self.final_projections['lor_qs_l'](x[:, 0, :]),
             self.final_projections['lor_qs_r'](x[:, 1, :]),
-            self.final_projections['lor_ks_l'](x[:, 2, :]),
+
+            # self.final_projections['lor_ks_l'](x[:, 2, :]),
+            kv_intermediate,
+
             self.final_projections['lor_ks_r'](x[:, 3, :]),
-            self.final_projections['lor_vs_l'](x[:, 4, :]),
+
+            # self.final_projections['lor_vs_l'](x[:, 4, :]),
+            kv_intermediate,
+
             self.final_projections['lor_vs_r'](x[:, 5, :]),
-            self.final_projections['lor_os_l'](x[:, 6, :]),
+
+            # self.final_projections['lor_os_l'](x[:, 6, :]),
+            ou_intermediate,
+
             self.final_projections['lor_os_r'](x[:, 7, :]),
+
             self.final_projections['lor_gs_l'](x[:, 8, :]),
             # ud_intermediate * -1,
+
             self.final_projections['lor_gs_r'](x[:, 9, :]),
+            # ou_intermediate,
 
             # self.final_projections['lor_us_l'](x[:, 10, :]),
             ud_intermediate,  # replace lor_us_l
 
-            self.final_projections['lor_us_r'](x[:, 11, :]),
+            # self.final_projections['lor_us_r'](x[:, 11, :]),
+            ou_intermediate,
+
             self.final_projections['lor_ds_l'](x[:, 12, :]),
 
             # self.final_projections['lor_ds_r'](x[:, 13, :]),
             ud_intermediate,  # replace lor_ds_r
         )
 
+
+
         return outputs
-
-
-
-
-
-
-
-
-
-# class LORProject(nn.Module):
-#     def __init__(self, dropout_rate=0.2):
-#         super().__init__()
-
-#         # Keep the same dimension initialization
-#         dim = model.model.embed_tokens.weight.shape[1]  # embedding dimension
-#         k_dim = model.model.layers[0].self_attn.k_proj.weight.shape[0]
-#         v_dim = model.model.layers[0].self_attn.v_proj.weight.shape[0]
-#         ff_dim = model.config.intermediate_size
-
-#         self.dim = dim
-#         self.k_dim = k_dim
-#         self.v_dim = v_dim
-#         self.ff_dim = ff_dim
-
-#         # Input size is batch_size x N_METAWEIGHTS x dim
-#         input_size = N_METAWEIGHTS * dim
-#         hidden_size = 2048  # Can be tuned
-
-#         # Calculate total output size
-#         output_sizes = [
-#             dim, dim,    # lor_qs_l, lor_qs_r
-#             k_dim, dim,  # lor_ks_l, lor_ks_r
-#             v_dim, dim,  # lor_vs_l, lor_vs_r
-#             dim, dim,    # lor_os_l, lor_os_r
-#             ff_dim, dim, # lor_gs_l, lor_gs_r
-#             ff_dim, dim, # lor_us_l, lor_us_r
-#             dim, ff_dim  # lor_ds_l, lor_ds_r
-#         ]
-#         total_output_size = sum(output_sizes)
-
-#         # Simple 2-layer MLP
-#         self.mlp = nn.Sequential(
-#             nn.LayerNorm(input_size),
-#             nn.Linear(input_size, hidden_size, bias=False),
-#             nn.GELU(),
-#             nn.Dropout(dropout_rate),
-#             nn.Linear(hidden_size, total_output_size, bias=False),
-#             nn.Dropout(dropout_rate)
-#         )
-
-#         # Store output sizes for splitting
-#         self.output_sizes = output_sizes
-
-#     def forward(self, x):
-#         """
-#         x: [B, N_METAWEIGHTS, D]
-#         Returns: tuple of 14 tensors with appropriate shapes
-#         """
-#         B = x.shape[0]
-
-#         # Flatten input
-#         x_flat = x.reshape(B, -1)
-
-#         # Pass through MLP
-#         output = self.mlp(x_flat)
-
-#         # Split output into appropriate sizes
-#         outputs = []
-#         start_idx = 0
-
-#         for size in self.output_sizes:
-#             end_idx = start_idx + size
-#             out_piece = output[:, start_idx:end_idx]
-#             outputs.append(out_piece)
-#             start_idx = end_idx
-
-#         # Handle the tied intermediate state for ud_intermediate
-#         # ud_intermediate = outputs[10]  # Use the lor_us_l output as ud_intermediate
-
-#         # Replace appropriate outputs with ud_intermediate
-#         final_outputs = (
-#             outputs[0],  # lor_qs_l
-#             outputs[1],  # lor_qs_r
-#             outputs[2],  # lor_ks_l
-#             outputs[3],  # lor_ks_r
-#             outputs[4],  # lor_vs_l
-#             outputs[5],  # lor_vs_r
-#             outputs[6],  # lor_os_l
-#             outputs[7],  # lor_os_r
-#             outputs[8],  # lor_gs_l
-#             outputs[9],  # lor_gs_r
-
-#             outputs[10],
-#             # ud_intermediate,  # replace lor_us_l
-
-#             outputs[11],  # lor_us_r
-#             outputs[12],  # lor_ds_l
-
-#             outputs[13],
-#             # ud_intermediate,  # replace lor_ds_r
-#         )
-
-#         return final_outputs
-
-
-
-
-
-
-
-
 
 
 
@@ -899,7 +822,7 @@ class LORNorm(nn.Module):
         #   here that we can limit the initial impact of LoR stuff by setting
         #   this low. This has a SIDE-EFFECT though of small grads to this layer.
         with torch.no_grad():
-            self.norm.weight[:] = self.norm.weight * 1e-2
+            self.norm.weight[:] = self.norm.weight * 1e-1
 
         # This is akin to He initialization. TODO: worth it?
         self.scale = (2 / in_dim) ** 0.5
@@ -1225,7 +1148,7 @@ global_epoch = 0
 train_alphabets = ["Latin", "Greek"]
 test_alphabets = ["Mongolian"]
 img_size = 28
-n_way = 3  # N-way classification
+n_way = 2  # N-way classification
 k_shot = 1  # k-shot learning
 q_query = 1  # query examples per class
 num_tasks = 100  # number of tasks per epoch
@@ -1395,8 +1318,8 @@ if False:
     axes[-1, 0].set_ylabel('Query\nSet', rotation=0, labelpad=40)
 
     plt.suptitle('Omniglot Few-Shot Learning Task Visualization\n'
-                f'{n_way}-way {k_shot}-shot with 1 query example per class',
-                y=1.02)
+                 f'{n_way}-way {k_shot}-shot with 1 query example per class',
+                 y=1.02)
     plt.tight_layout()
 
     plt.show()
@@ -1438,19 +1361,23 @@ train_losses = []
 test_losses = []
 best_loss = float('inf')
 
-model.train()
+
 for epoch in range(num_epochs):
     global_epoch += 1
 
     # with torch.autograd.detect_anomaly():
+    model.train()
     train_loss = run_epoch(model, img_proj, lor_models, INNER_LR, train_dl, optimizer, DEVICE, train=True)
 
     train_losses.append(train_loss)
     if LOG: writer.add_scalars('loss', {'train': train_loss}, global_epoch)
 
     if epoch % 5 == 0:
-        test_loss = run_epoch(model, img_proj, lor_models, INNER_LR, test_dl, optimizer, DEVICE, train=False)
+        model.eval()
+        with torch.no_grad():
+            test_loss = run_epoch(model, img_proj, lor_models, INNER_LR, test_dl, optimizer, DEVICE, train=False)
         test_losses.append(test_loss)
+
         if LOG: writer.add_scalars('loss', {'test': test_loss}, global_epoch)
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}")
     else:
