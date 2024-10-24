@@ -760,7 +760,9 @@ class LORProject(nn.Module):
         ou_intermediate = torch.randn(B, self.dim, device=device)
 
         outputs = (
-            self.final_projections['lor_qs_l'](x[:, 0, :]),
+            # self.final_projections['lor_qs_l'](x[:, 0, :]),
+            torch.cat([kv_intermediate] * (self.dim // self.k_dim), dim=-1),
+
             self.final_projections['lor_qs_r'](x[:, 1, :]),
 
             # self.final_projections['lor_ks_l'](x[:, 2, :]),
