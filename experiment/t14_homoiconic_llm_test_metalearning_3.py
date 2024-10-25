@@ -517,10 +517,7 @@ def build_parses(lor_ixs_per_layer, hidden_states, num_layers):
     Returns:
         dict: Dictionary with parsed representations per layer, containing tuples of selected spans
     '''
-    h_emb = hidden_states[-1]  # final layer states
     parses_dict = {}
-
-    breakpoint()
 
     # iterate over all layers
     for layer_ix in range(num_layers):
@@ -537,7 +534,7 @@ def build_parses(lor_ixs_per_layer, hidden_states, num_layers):
         assert lor_ix_spans.max() <= hidden_states[-1].shape[1]
 
         # select spans for this layer
-        parses = select_spans(h_emb, lor_ix_spans)
+        parses = select_spans(hidden_states, lor_ix_spans)
 
         # store parsed representations
         if (parses > -1).sum() == 0:
@@ -591,15 +588,15 @@ def apply_lor_models(parses, lor_models, lor_cache):
 
     return lor_cache
 
-def update_lors(lor_models, lor_cache, lor_ixs_per_layer, hidden_states, num_layers):
-    ''' Update the LORs by interpreting hidden states as new lor blocks '''
-    # Build parsed representations
-    parses = build_parses(lor_ixs_per_layer, hidden_states, num_layers)
+# def update_lors(lor_models, lor_cache, lor_ixs_per_layer, hidden_states, num_layers):
+#     ''' Update the LORs by interpreting hidden states as new lor blocks '''
+#     # Build parsed representations
+#     parses = build_parses(lor_ixs_per_layer, hidden_states, num_layers)
 
-    # Apply LOR models and update cache
-    updated_cache = apply_lor_models(parses, lor_models, lor_cache)
+#     # Apply LOR models and update cache
+#     updated_cache = apply_lor_models(parses, lor_models, lor_cache)
 
-    return updated_cache
+#     return updated_cache
 
 
 
@@ -1113,7 +1110,11 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
                             uncausal_mask=torch.cat([img_uncausal_mask, meta_uncausal_mask], dim=1),
                             **empty_lor_cache,
                             )
-                lor_cache = update_lors(lor_models, empty_lor_cache, lor_ixs_per_layer, out.hidden_states, num_layers)
+
+
+                # use final layers hidden states for LOR
+                parses = build_parses(lor_ixs_per_layer, out.hidden_states[-1], num_layers)
+                lor_cache = apply_lor_models(parses, lor_models, empty_lor_cache)
 
                 # N steps of metalearning
                 for i in range(N_LOOPS):
@@ -1216,31 +1217,52 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
 
 
 
-            # #####
-            # # SHAM QUERY, re-run support for final loss
+            #####
+            # SHAM QUERY, re-run support for final loss, which likely was memorized
 
-            # lorm = partially_apply_models(lor_models, lor_cache)
+            lorm = partially_apply_models(lor_models, lor_cache)
 
-            # SS = support_imgs.shape[1]
-            # s_attention_mask = torch.ones(B, SS, device=device, dtype=torch.long)
+            SS = support_imgs.shape[1]
+            s_attention_mask = torch.ones(B, SS, device=device, dtype=torch.long)
 
+
+            # EXPERIMENT: always swap
+            swap_support_imgs = torch.stack([support_imgs[:, 1], support_imgs[:, 0]], dim=1)
+
+
+            # # EXPERIMENT: randomly swap order for entire batch
             # # swap positions of support imgs (only works with N_way==2) so it can't just memorize output labels
-            # # swap_support_imgs = torch.stack([support_imgs[:, 1], support_imgs[:, 0]], dim=1)
-            # swap_support_imgs = support_imgs
+            # if random.random() > 0.5:
+            #     swap_support_imgs = torch.stack([support_imgs[:, 1], support_imgs[:, 0]], dim=1)
+            # else:
+            #     swap_support_imgs = support_imgs
 
-            # query_out = model(
-            #     inputs_embeds=support_imgs,
-            #     attention_mask=s_attention_mask,
-            #     uncausal_mask=img_uncausal_mask,
-            #     **lorm,
-            # )
-            # logits = query_out.logits[:, :Ss].contiguous().view(-1, vocab_size)  # [B, S-1, D] -> [B * (S-1), D]
-            # target = support_labels.contiguous().view(-1)  # [B, S-1] -> [B * (S-1)]
-            # qloss = F.cross_entropy(logits, target)
-            # # final metalearning loss + query loss
-            # # loss = loss + qloss
-            # loss = qloss
-            # #####
+
+            # # EXPERIMENT: randomly swap per batch item
+            # # Assuming support_imgs has shape [batch_size, 2, ...]
+            # batch_size = support_imgs.shape[0]
+            # should_swap = torch.rand(batch_size) > 0.5  # Generate random boolean mask for each batch item
+            # should_swap = should_swap.view(-1, 1, *(1,) * (support_imgs.dim() - 2))  # Reshape for broadcasting
+            # # Create both possible orders and select based on the mask
+            # original = support_imgs
+            # swapped = torch.stack([support_imgs[:, 1], support_imgs[:, 0]], dim=1)
+            # swap_support_imgs = torch.where(should_swap, swapped, original)
+
+
+
+            query_out = model(
+                inputs_embeds=swap_support_imgs,
+                attention_mask=s_attention_mask,
+                uncausal_mask=img_uncausal_mask,
+                **lorm,
+            )
+            logits = query_out.logits[:, :Ss].contiguous().view(-1, vocab_size)  # [B, S-1, D] -> [B * (S-1), D]
+            target = support_labels.contiguous().view(-1)  # [B, S-1] -> [B * (S-1)]
+            qloss = F.cross_entropy(logits, target)
+            # final metalearning loss + query loss
+            # loss = loss + qloss
+            loss = qloss
+            #####
 
             if torch.isnan(loss):
                 print('NaN encountered:')
@@ -1471,7 +1493,7 @@ class ConvEncoder(nn.Module):
 
 img_proj = ConvEncoder(dim)
 img_proj.to(DEVICE)
-
+print_model_info(img_proj)
 
 
 
