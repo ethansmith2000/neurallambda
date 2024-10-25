@@ -60,6 +60,7 @@ DESIGN CHOICES:
 - img_proj: architecture and init
 - LORNorm: keep norm in it?
 - uncausal masking (support, metaweights, queries)
+- targeted LOR_LAYER
 
 TODO:
 - [ ] optimize metaweights instead of LORProjected metaweights
@@ -127,7 +128,7 @@ random.seed(SEED)
 DEVICE = 'cuda'
 WHICH_LOR = 1
 N_METAWEIGHTS = 14  # QKVOGUD * 2
-LOR_LAYER = 5  # target of LOR stuff
+LOR_LAYER = 2  # target of LOR stuff
 
 
 ##################################################
@@ -430,64 +431,177 @@ reference the current lor cache. This is where they get it from.'''
     return fs
 
 
-def update_lors(
-        lor_models,  # shaped like `empty_lors`. Contains lor_proj, and per-head models
-        lor_cache,  # shaped like `empty_lors`. Contains previously parsed lors
-        lor_ixs_per_layer: List[torch.Tensor],  # List[spans], where a span is [batch, (start_ix, end_ix)]
-        hidden_states,  # from out.hidden_states, so, contains all layers
-        num_layers,
-):
-    ''' Update the LORs by interpreting hidden states as new lor blocks '''
+# def update_lors(
+#         lor_models,  # shaped like `empty_lors`. Contains lor_proj, and per-head models
+#         lor_cache,  # shaped like `empty_lors`. Contains previously parsed lors
+#         lor_ixs_per_layer: List[torch.Tensor],  # List[spans], where a span is [batch, (start_ix, end_ix)]
+#         hidden_states,  # from out.hidden_states, so, contains all layers
+#         num_layers,
+# ):
+#     ''' Update the LORs by interpreting hidden states as new lor blocks '''
 
-    # check that lor_models and lor_cache are defined (at least None values)
-    # for each layer, and that there's a model for every cache key
-    lor_keys = lor_cache.keys()
-    for k in lor_keys:
-        assert (
-            len(lor_models[k]) ==  # one (optional) lor module per layer
-            len(lor_cache[k]) ==  # cache per layer
-            num_layers
-        ), (f'''
-{len(lor_models[k])=} ==  # one (optional) lor module per layer
-{len(lor_cache[k])=} ==  # cache per layer
-{num_layers=}
-''')
+#     # check that lor_models and lor_cache are defined (at least None values)
+#     # for each layer, and that there's a model for every cache key
+#     lor_keys = lor_cache.keys()
+#     for k in lor_keys:
+#         assert (
+#             len(lor_models[k]) ==  # one (optional) lor module per layer
+#             len(lor_cache[k]) ==  # cache per layer
+#             num_layers
+#         ), (f'''
+# {len(lor_models[k])=} ==  # one (optional) lor module per layer
+# {len(lor_cache[k])=} ==  # cache per layer
+# {num_layers=}
+# ''')
 
+#     h_emb = hidden_states[-1]  # final layer states
+
+#     # iterate over all layers
+#     for layer_ix in range(num_layers):
+#         lor_ix_spans = lor_ixs_per_layer[layer_ix]
+
+#         # skip non-lor'd layers
+#         if lor_models['lor_proj'][layer_ix] is None:
+#             assert lor_ix_spans is None, f'lor_proj is not defined for layer {layer_ix}, but there are lor_ix_spans is defined for this layer'
+#             continue
+
+#         # check that spans are within bounds
+#         assert isinstance(lor_ix_spans, torch.Tensor)
+#         assert lor_ix_spans.min() >= -1
+#         assert lor_ix_spans.max() <= hidden_states[-1].shape[1]
+
+#         parses = select_spans(h_emb, lor_ix_spans)
+
+#         # no parses implied anywhere
+#         if (parses > -1).sum() == 0:
+#             continue
+
+#         # run lor_proj. Returns tuple of L and R singular values, per key, eg: (lor_qs_l, lor_qs_r, ...)
+#         projs = lor_models['lor_proj'][layer_ix](parses)
+#         proj_pairs = zip(projs[::2], projs[1::2])
+
+#         # update cache
+#         for k, (l, r) in zip(lor_keys, proj_pairs):
+#             if lor_cache[k][layer_ix] is None:  # is first pass, no cache yet
+#                 lor_cache[k][layer_ix] = (l.unsqueeze(2), r.unsqueeze(2))  # [B, DIM, RANK]
+#             else:
+#                 lor_cache[k][layer_ix] = (torch.cat([lor_cache[k][layer_ix][0], l.unsqueeze(2)], dim=2),
+#                                           torch.cat([lor_cache[k][layer_ix][1], r.unsqueeze(2)], dim=2))  # [B, DIM, RANK]
+
+#     return lor_cache
+
+# def build_parses(lor_ixs_per_layer, hidden_states, num_layers):
+#     '''
+#     returns a dictionary shaped like `empty_lor_cache` where each key has a list with an entry per layer, and that entry contains a tuple of the left and right parses
+#     '''
+#     pass
+
+# def apply_lor_models(parses, lor_models, lor_cache):
+#     '''
+#     apply lor_models to the output of `build_parases`
+#     '''
+#     pass
+
+
+
+
+def build_parses(lor_ixs_per_layer, hidden_states, num_layers):
+    '''
+    Build parsed representations from hidden states based on provided indices.
+
+    Args:
+        lor_ixs_per_layer: List[torch.Tensor]  # List[spans], where a span is [batch, (start_ix, end_ix)]
+        hidden_states: List[torch.Tensor]  # from out.hidden_states, contains all layers
+        num_layers: int  # total number of layers
+
+    Returns:
+        dict: Dictionary with parsed representations per layer, containing tuples of selected spans
+    '''
     h_emb = hidden_states[-1]  # final layer states
+    parses_dict = {}
+
+    breakpoint()
 
     # iterate over all layers
     for layer_ix in range(num_layers):
         lor_ix_spans = lor_ixs_per_layer[layer_ix]
 
-        # skip non-lor'd layers
-        if lor_models['lor_proj'][layer_ix] is None:
-            assert lor_ix_spans is None, f'lor_proj is not defined for layer {layer_ix}, but there are lor_ix_spans is defined for this layer'
+        # skip layers without spans
+        if lor_ix_spans is None:
+            parses_dict[layer_ix] = None
             continue
 
-        # check that spans are within bounds
+        # validate spans
         assert isinstance(lor_ix_spans, torch.Tensor)
         assert lor_ix_spans.min() >= -1
         assert lor_ix_spans.max() <= hidden_states[-1].shape[1]
 
+        # select spans for this layer
         parses = select_spans(h_emb, lor_ix_spans)
 
-        # no parses implied anywhere
+        # store parsed representations
         if (parses > -1).sum() == 0:
+            parses_dict[layer_ix] = None
+        else:
+            parses_dict[layer_ix] = parses
+
+    return parses_dict
+
+def apply_lor_models(parses, lor_models, lor_cache):
+    '''
+    Apply LOR models to parsed representations and update the cache.
+
+    Args:
+        parses: dict  # Output from build_parses, containing parsed representations per layer
+        lor_models: dict  # Contains lor_proj and per-head models
+        lor_cache: dict  # Contains previously parsed lors
+
+    Returns:
+        dict: Updated LOR cache
+    '''
+    # validate input structures
+    lor_keys = lor_cache.keys()
+    num_layers = len(lor_cache[next(iter(lor_keys))])
+
+    for k in lor_keys:
+        assert (
+            len(lor_models[k]) == len(lor_cache[k]) == num_layers
+        ), f"Mismatched lengths: lor_models[{k}]={len(lor_models[k])}, lor_cache[{k}]={len(lor_cache[k])}, num_layers={num_layers}"
+
+    # process each layer
+    for layer_ix in range(num_layers):
+        # skip layers without models or parses
+        if lor_models['lor_proj'][layer_ix] is None or parses[layer_ix] is None:
             continue
 
-        # run lor_proj. Returns tuple of L and R singular values, per key, eg: (lor_qs_l, lor_qs_r, ...)
-        projs = lor_models['lor_proj'][layer_ix](parses)
+        # run lor_proj to get L and R singular values
+        layer_parses = parses[layer_ix]
+        projs = lor_models['lor_proj'][layer_ix](layer_parses)
         proj_pairs = zip(projs[::2], projs[1::2])
 
-        # update cache
+        # update cache for each key
         for k, (l, r) in zip(lor_keys, proj_pairs):
-            if lor_cache[k][layer_ix] is None:  # is first pass, no cache yet
+            if lor_cache[k][layer_ix] is None:
                 lor_cache[k][layer_ix] = (l.unsqueeze(2), r.unsqueeze(2))  # [B, DIM, RANK]
             else:
-                lor_cache[k][layer_ix] = (torch.cat([lor_cache[k][layer_ix][0], l.unsqueeze(2)], dim=2),
-                                          torch.cat([lor_cache[k][layer_ix][1], r.unsqueeze(2)], dim=2))  # [B, DIM, RANK]
+                lor_cache[k][layer_ix] = (
+                    torch.cat([lor_cache[k][layer_ix][0], l.unsqueeze(2)], dim=2),
+                    torch.cat([lor_cache[k][layer_ix][1], r.unsqueeze(2)], dim=2)
+                )  # [B, DIM, RANK]
 
     return lor_cache
+
+def update_lors(lor_models, lor_cache, lor_ixs_per_layer, hidden_states, num_layers):
+    ''' Update the LORs by interpreting hidden states as new lor blocks '''
+    # Build parsed representations
+    parses = build_parses(lor_ixs_per_layer, hidden_states, num_layers)
+
+    # Apply LOR models and update cache
+    updated_cache = apply_lor_models(parses, lor_models, lor_cache)
+
+    return updated_cache
+
+
 
 
 def select_spans(x, indices):
