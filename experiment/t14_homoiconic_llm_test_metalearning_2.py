@@ -49,6 +49,8 @@ STABILIZATION:
 - rm Dropout in LORProject, helped a ton (DID IT?)
 - randn up-down random intermediate seems important. Without, i can reach "better than chance" but even that's unstable. Using a projection instead of randn seems ok; starts off way worse so init matters, and is less stable.
 - LORNorm: small init (normal_init * 1e-2) for RMSNorm helps a lot
+- reducing MLP intermediate dims seems to help stability
+
 
 DESIGN CHOICES:
 - MLPMixer (rm dropout. intermediate size?. residuals? act fn? RMSNorm?)
@@ -58,16 +60,23 @@ DESIGN CHOICES:
 - metatokens as randn?  (embeddings seem to help, maybe)
 - feedback updated metaweights each inner loop?
 - img_proj: architecture and init
+- LORNorm: keep norm in it?
+- uncausal masking (support, metaweights, queries)
 
 TODO:
-- [ ] fix run_epoch
+- [ ] optimize metaweights instead of LORProjected metaweights
+- [ ] learnable inner loop lrs (perhaps different lrs per step)
+- [ ] increase metaweight rank
+- [ ] pass revised metaweights forward each inner loop
+
+- [X] fix run_epoch
   - [X] update for new dataset
   - [X] add image projector
   - [X] tokenize labels
   - [X] append metatokens
   - [X] metalearn them
   - [X] prove loss can decrease for supports before worrying about queries
-  - [ ] test on queries
+  - [X] test on queries
 
 - options
   1. [ ] keep model frozen, only train LORProject
@@ -85,6 +94,7 @@ from typing import List, Dict, Any, Tuple
 from tqdm import tqdm
 import warnings
 from functools import partial
+import itertools
 from datetime import datetime
 
 import torch
@@ -119,7 +129,7 @@ random.seed(SEED)
 DEVICE = 'cuda'
 WHICH_LOR = 1
 N_METAWEIGHTS = 14  # QKVOGUD * 2
-LOR_LAYER = 2  # target of LOR stuff
+LOR_LAYER = 5  # target of LOR stuff
 
 
 ##################################################
@@ -640,8 +650,8 @@ class LORProject(nn.Module):
             dim, ff_dim  # lor_ds_l, lor_ds_r
         ]
 
-        self.token_mixing_dim = 128
-        self.channel_mixing_dim = 128
+        self.token_mixing_dim = 256
+        self.channel_mixing_dim = 256
 
         # Token-mixing MLP
         self.token_mixing_mlp = nn.Sequential(
@@ -675,15 +685,11 @@ class LORProject(nn.Module):
             'lor_os_r': nn.Linear(dim, dim, bias=False),
             'lor_gs_l': nn.Linear(dim, ff_dim, bias=False),
             'lor_gs_r': nn.Linear(dim, dim, bias=False),
-            # 'lor_us_l': nn.Linear(dim, ff_dim, bias=False),
+            'lor_us_l': nn.Linear(dim, ff_dim, bias=False),
             'lor_us_r': nn.Linear(dim, dim, bias=False),
             'lor_ds_l': nn.Linear(dim, dim, bias=False),
-            # 'lor_ds_r': nn.Linear(dim, ff_dim, bias=False),
-
-            # 'lor_us_l_ds_r': nn.Linear(dim, ff_dim, bias=False),
-
+            'lor_ds_r': nn.Linear(dim, ff_dim, bias=False),
         })
-
 
         # LORModule must play nicely in a batch situation, where some samples
         # of the batch imply lor parses and others don't. Non LoR'd samples
@@ -722,11 +728,32 @@ class LORProject(nn.Module):
 
         # x = residual + x
 
-        ##########
-        # Tie intermediates. Adopting results from (ie, results from t14_homoiconic_llm_adding_data_to_mlp)
+        # ##########
+        # # Don't tie intermediates
 
-        # # Generated `ud_intermediate`
-        # ud_intermediate = self.final_projections['lor_us_l_ds_r'](x[:, 10])
+        # outputs = (
+        #     self.final_projections['lor_qs_l'](x[:, 0, :]),
+        #     self.final_projections['lor_qs_r'](x[:, 1, :]),
+        #     self.final_projections['lor_ks_l'](x[:, 2, :]),
+        #     self.final_projections['lor_ks_r'](x[:, 3, :]),
+        #     self.final_projections['lor_vs_l'](x[:, 4, :]),
+        #     self.final_projections['lor_vs_r'](x[:, 5, :]),
+        #     self.final_projections['lor_os_l'](x[:, 6, :]),
+        #     self.final_projections['lor_os_r'](x[:, 7, :]),
+        #     self.final_projections['lor_gs_l'](x[:, 8, :]),
+        #     self.final_projections['lor_gs_r'](x[:, 9, :]),
+        #     self.final_projections['lor_us_l'](x[:, 10, :]),
+        #     self.final_projections['lor_us_r'](x[:, 11, :]),
+        #     self.final_projections['lor_ds_l'](x[:, 12, :]),
+        #     self.final_projections['lor_ds_r'](x[:, 13, :]),
+        # )
+        # return outputs
+
+
+
+        # ##########
+        # # Tie intermediates. Adopting results from (ie, results from t14_homoiconic_llm_adding_data_to_mlp)
+
 
         # # NOTE: statistics of randn are likely way off
         # # TODO: bc of this shrink, shrink token_mixing_mlp from dim=14 to dim=12, since those outputs go unused
@@ -753,7 +780,11 @@ class LORProject(nn.Module):
         #     # self.final_projections['lor_ds_r'](x[:, 13, :]),
         #     ud_intermediate,  # replace lor_ds_r
         # )
+        # return outputs
 
+
+        ##########
+        # Tie many intermediates. Adopting results from (ie, results from t14_homoiconic_llm_adding_data_to_mlp)
 
         ud_intermediate = torch.randn(B, self.ff_dim, device=device)
         kv_intermediate = torch.randn(B, self.k_dim, device=device)
@@ -798,13 +829,7 @@ class LORProject(nn.Module):
             ud_intermediate,  # replace lor_ds_r
         )
 
-
-
         return outputs
-
-
-
-
 
 
 
@@ -852,9 +877,19 @@ class LORNorm(nn.Module):
           hidden_state: hidden_state at this layer, that projects through this layer's associated linear QKVOGUD block, and will be used to project through the LoR version too.
 
         '''
+
+        # # EXPERIMENT: no norm
+        # if lor_cache is not None:
+        #     lorl, lorr = lor_cache
+        #     l = apply_lor(hidden_state, lorl, lorr)
+        #     # return self.norm(original + l * self.scale)  # TODO: revisit if `scale` is good
+        #     return original + l
+        # else:
+        #     return original
+
+
         if lor_cache is not None:
             lorl, lorr = lor_cache
-            # print(f'name: {self.name}') # DEBUG
             l = apply_lor(hidden_state, lorl, lorr)
             # return self.norm(original + l * self.scale)  # TODO: revisit if `scale` is good
             return self.norm(original + l)
@@ -909,9 +944,11 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
             supports, queries = batch
 
             # Move to device, flatten and project images into embedding dim
-            support_imgs = img_proj(torch.stack([x[0].to(device).flatten(start_dim=1, end_dim=2) for x in supports], dim=1))  # N*k tensors [B, IMG, IMG] -> [B, N*k, D]
+
+            # unsqueeze channel dim
+            support_imgs = torch.stack([img_proj(x[0].to(device).unsqueeze(1)) for x in supports], dim=1)  # N*k tensors [B, channel, IMG, IMG] -> [B, N*k, D]
             support_labels = torch.stack([x[1].to(device) for x in supports], dim=1)  # N*k tensors, shape=[B] -> [B, N*k]
-            query_imgs = img_proj(torch.stack([x[0].to(device).flatten(start_dim=1, end_dim=2) for x in queries], dim=1))  # N*k tensors [B, IMG, IMG] -> [B, N*k, D]
+            query_imgs = torch.stack([img_proj(x[0].to(device).unsqueeze(1)) for x in queries], dim=1)  # N*k tensors [B, IMG, IMG] -> [B, N*k, D]
             query_labels = torch.stack([x[1].to(device) for x in queries], dim=1)  # N*k tensors, shape=[B] -> [B, N*k]
 
             B, Ss = support_labels.shape  # batch size, sequence (N*k)
@@ -1003,12 +1040,13 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
 
                     grads = torch.autograd.grad(loss, params, create_graph=True)
 
-                    MAX_GRAD_NORM = 1.0
-                    grads = [g.renorm(2, dim=-1, maxnorm=MAX_GRAD_NORM) for g in grads]
+                    # MAX_GRAD_NORM = 1.0
+                    # grads = [g.renorm(2, dim=-1, maxnorm=MAX_GRAD_NORM) for g in grads]
 
                     if i == N_LOOPS - 1:
                         print(f'iloss: {loss.item():>.6f}')
 
+                    # Optimizer init
                     if opt_state is None:
                         match INNER_OPT:
                             case 'sgd_momentum':
@@ -1020,6 +1058,7 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
                             case 'adamax':
                                 opt_state = adamax_init(params)
 
+                    # Optimization step
                     match INNER_OPT:
                         case 'sgd':
                             new_params = sgd(params, grads, lr=inner_lr)
@@ -1032,6 +1071,7 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
                         case 'adamax':
                             new_params, *opt_state = adamax(params, grads, *opt_state, lr=inner_lr)
 
+                    # replace lor_cache with trained version
                     lor_cache = empty_lors(model.config.num_hidden_layers)
                     for (k, lix, tuple_ix), p in zip(key_ixs, new_params):
                         if lor_cache[k][lix] is None:
@@ -1041,17 +1081,15 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
 
 
 
-
             # #####
             # # QUERY with lor_cache, but no attention to original inputs (answers must live in weights ie lor_cache)
 
             # lorm = partially_apply_models(lor_models, lor_cache)
 
-            # SQ = query_imgs.shape[1]
-            # q_attention_mask = torch.ones(B, SQ, device=device, dtype=torch.long)
             # query_out = model(
             #     inputs_embeds=query_imgs,
-            #     attention_mask=q_attention_mask,
+            #     attention_mask=query_attention_mask,
+            #     uncausal_mask=query_uncausal_mask,
             #     **lorm,
             # )
 
@@ -1060,7 +1098,10 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
             # qloss = F.cross_entropy(logits, target)
 
             # # final metalearning loss + query loss
-            # loss = loss + qloss
+            # # loss = loss * 0.2 + qloss
+            # loss = qloss
+            # #####
+
 
 
             # #####
@@ -1071,31 +1112,26 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
             # SS = support_imgs.shape[1]
             # s_attention_mask = torch.ones(B, SS, device=device, dtype=torch.long)
 
+            # # swap positions of support imgs (only works with N_way==2) so it can't just memorize output labels
+            # # swap_support_imgs = torch.stack([support_imgs[:, 1], support_imgs[:, 0]], dim=1)
+            # swap_support_imgs = support_imgs
+
             # query_out = model(
             #     inputs_embeds=support_imgs,
             #     attention_mask=s_attention_mask,
-
-            #     # inputs_embeds=inputs_embeds,
-            #     # attention_mask=img_attention_mask,
-            #     # uncausal_mask=uncausal_mask,
-
+            #     uncausal_mask=img_uncausal_mask,
             #     **lorm,
             # )
-
-            # logits = query_out.logits[:, :S].contiguous().view(-1, vocab_size)  # [B, S-1, D] -> [B * (S-1), D]
+            # logits = query_out.logits[:, :Ss].contiguous().view(-1, vocab_size)  # [B, S-1, D] -> [B * (S-1), D]
             # target = support_labels.contiguous().view(-1)  # [B, S-1] -> [B * (S-1)]
             # qloss = F.cross_entropy(logits, target)
-
             # # final metalearning loss + query loss
             # # loss = loss + qloss
             # loss = qloss
-
+            # #####
 
             if torch.isnan(loss):
                 print('NaN encountered:')
-                # print(f'  all loss was masked out?: {sum([x.to(dtype=torch.long).sum() for x in loss_masks]) == 0}')
-                # print(f'  nan in out_logits?: {torch.cat(out_logits, dim=1).isnan().sum() > 0}')
-                # print('  ragged batch sizes? (double check by hand if necessary)')
                 breakpoint()
 
             if train:
@@ -1124,7 +1160,7 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
     if LOG and train:
         try:
             # for name, param in itertools.chain(model.named_parameters(), lor_models.named_parameters()):
-            for name, param in lor_models.named_parameters():
+            for name, param in itertools.chain(lor_models.named_parameters() + img_proj.named_parameters()):
                 if param.requires_grad:
                     writer.add_histogram(f'weights/{name}', param.data.detach().to(dtype=torch.float32).cpu().numpy(), global_epoch)
                     if param.grad is not None:
@@ -1242,15 +1278,151 @@ add_hooks(lor_models)
 ##########
 # Image Projection
 
-img_proj = nn.Sequential(
-    nn.Linear(img_size ** 2, dim),
-    nn.LayerNorm(dim)
-)
-with torch.no_grad():
-    assert isinstance(img_proj[1], nn.LayerNorm)
-    img_proj[1].weight[:] = torch.ones_like(img_proj[1].weight) * 1e-1
+#####
 
+# img_proj = nn.Sequential(
+#     nn.Linear(img_size ** 2, dim),
+#     nn.LayerNorm(dim)
+# )
+# with torch.no_grad():
+#     assert isinstance(img_proj[1], nn.LayerNorm)
+#     img_proj[1].weight[:] = torch.ones_like(img_proj[1].weight) * 1e-1
+
+# img_proj.to(DEVICE)
+
+
+#####
+
+
+
+class ConvEncoder(nn.Module):
+    """Convolutional encoder for 28x28 grayscale images.
+
+    Args:
+        embedding_dim (int): Size of the output embedding. Default: 896
+
+    Input shape: [batch_size, 1, 28, 28]
+    Output shape: [batch_size, embedding_dim]
+    """
+
+    def __init__(self, embedding_dim):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            # First block
+            # [batch, 1, 28, 28] -> [batch, 64, 28, 28]
+            nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            # -> [batch, 64, 14, 14]
+            nn.MaxPool2d(2, 2),
+
+            # Second block
+            # -> [batch, 128, 14, 14]
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+            # -> [batch, 128, 7, 7]
+            nn.MaxPool2d(2, 2),
+
+            # Third block
+            # -> [batch, 256, 7, 7]
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.GELU(),
+
+            # -> [batch, 256, 4, 4]
+            nn.AdaptiveAvgPool2d((4, 4))
+        )
+
+        self.flat_size = 256 * 4 * 4  # 4096
+
+        self.projection = nn.Sequential(
+            nn.Flatten(),
+            # nn.Dropout(0.5),
+            nn.Linear(self.flat_size, embedding_dim),
+            nn.LayerNorm(embedding_dim)
+        )
+
+    def forward(self, x):
+        # Check input shape
+        if len(x.shape) != 4:
+            raise ValueError(f"Expected 4D input (batch, channels, height, width), got {len(x.shape)}D")
+        if x.shape[1] != 1:
+            raise ValueError(f"Expected 1 input channel, got {x.shape[1]}")
+        if x.shape[2] != 28 or x.shape[3] != 28:
+            raise ValueError(f"Expected 28x28 images, got {x.shape[2]}x{x.shape[3]}")
+
+        x = self.encoder(x)
+        x = self.projection(x)
+        return x
+
+img_proj = ConvEncoder(dim)
 img_proj.to(DEVICE)
+
+
+
+
+
+
+# @@@@@@@@@@
+
+
+# START_BLOCK_2
+
+# Test conv encoder's ability to memorize random data
+if False:
+    # Create simple random dataset
+    NUM_SAMPLES = 5000
+    BATCH_SIZE = 32
+    NUM_EPOCHS = 100
+    LR = 0.001
+
+    # Fixed random data
+    X = torch.randn(NUM_SAMPLES, 1, 28, 28)  # Random images
+    Y = torch.randn(NUM_SAMPLES, 896)  # Random targets
+    X = X.to(DEVICE)
+    Y = Y.to(DEVICE)
+
+    # Training loop
+    optimizer = optim.Adam(img_proj.parameters(), lr=LR)
+    losses = []
+
+    img_proj.train()
+    for epoch in range(NUM_EPOCHS):
+        # Process entire batch at once since dataset is small
+        embeddings = img_proj(X)
+        loss = F.mse_loss(embeddings, Y)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        losses.append(loss.item())
+
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch+1}/{NUM_EPOCHS}, Loss: {loss.item():.4f}")
+
+    # Plot loss curve
+    plt.figure(figsize=(10, 5))
+    plt.plot(losses)
+    plt.title('Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('MSE Loss')
+    plt.grid(True)
+    plt.show()
+
+    # Test overfitting
+    img_proj.eval()
+    with torch.no_grad():
+        embeddings = img_proj(X)
+        final_loss = F.mse_loss(embeddings, Y)
+        print(f"\nFinal MSE loss: {final_loss.item():.4f}")
+
+# END_BLOCK_2
+
+
+
 
 ##########
 # Dataset
@@ -1281,8 +1453,6 @@ if False:
         query_imgs = torch.stack([x[0].to(DEVICE).flatten(start_dim=1, end_dim=2) for x in queries], dim=1)  # N*k tensors [B, IMG, IMG]
         query_labels = torch.stack([x[1].to(DEVICE) for x in queries], dim=1)  # N*k tensors, shape=[B] -> [B, N*k]
         break
-
-
 
     # We'll visualize the first batch only
     batch_idx = 0
@@ -1417,97 +1587,3 @@ for k in lor_models.keys():
             print(f'{k} | {n}')
             xs = [f'{x:>.3f}' for x in p.flatten()[:10].tolist()]
             print(f'{p.min().item():>.3f}, {p.max().item():>.3f}, {p.mean().item():>.3f}, {p.std().item():>.3f}, {xs}')
-
-
-'''
-
-lor_proj | token_mixing_mlp.0.weight
-1.000, 1.000, 1.000, 0.000, ['1.000', '1.000', '1.000', '1.000', '1.000', '1.000', '1.000', '1.000', '1.000', '1.000']
-
-lor_proj | token_mixing_mlp.1.weight
--0.267, 0.266, -0.002, 0.153, ['0.200', '-0.127', '-0.068', '0.026', '0.167', '0.043', '-0.109', '0.084', '-0.182', '-0.058']
-
-lor_proj | token_mixing_mlp.4.weight
--0.088, 0.088, 0.001, 0.051, ['0.079', '-0.015', '-0.046', '-0.066', '-0.068', '-0.031', '-0.022', '-0.029', '-0.008', '-0.036']
-
-
-
-lor_proj | channel_mixing_mlp.0.weight
-0.997, 1.002, 1.000, 0.001, ['1.000', '1.000', '0.999', '0.999', '0.999', '0.998', '1.000', '0.999', '0.998', '0.999']
-
-lor_proj | channel_mixing_mlp.1.weight
--0.036, 0.036, -0.000, 0.019, ['0.012', '0.012', '0.005', '0.004', '-0.022', '0.026', '0.032', '0.016', '-0.028', '-0.023']
-
-lor_proj | channel_mixing_mlp.4.weight
--0.090, 0.090, 0.000, 0.051, ['-0.045', '-0.015', '-0.001', '-0.007', '-0.005', '0.068', '-0.049', '0.084', '0.028', '-0.019']
-
-
-
-lor_proj | final_projections.lor_qs_l.weight
--0.033, 0.033, -0.000, 0.019, ['0.024', '-0.005', '-0.022', '0.033', '0.018', '-0.019', '-0.017', '0.031', '-0.021', '0.012']
-
-lor_proj | final_projections.lor_qs_r.weight
--0.033, 0.033, -0.000, 0.019, ['0.011', '0.026', '-0.011', '0.030', '0.002', '-0.001', '-0.027', '0.011', '0.032', '-0.017']
-
-lor_proj | final_projections.lor_ks_l.weight
--0.033, 0.033, 0.000, 0.019, ['-0.029', '-0.008', '0.025', '0.010', '0.022', '0.019', '0.028', '-0.006', '0.011', '0.023']
-
-lor_proj | final_projections.lor_ks_r.weight
--0.033, 0.033, -0.000, 0.019, ['-0.000', '0.011', '-0.019', '0.032', '0.030', '0.020', '0.003', '-0.031', '-0.012', '-0.031']
-
-lor_proj | final_projections.lor_vs_l.weight
--0.035, 0.035, -0.000, 0.019, ['-0.015', '0.016', '0.014', '-0.021', '-0.015', '-0.012', '-0.028', '0.030', '-0.021', '0.009']
-
-lor_proj | final_projections.lor_vs_r.weight
--0.035, 0.035, -0.000, 0.019, ['0.025', '0.004', '-0.027', '-0.011', '0.011', '-0.022', '0.017', '-0.013', '0.001', '-0.029']
-
-lor_proj | final_projections.lor_os_l.weight
--0.036, 0.037, -0.000, 0.019, ['-0.027', '0.023', '-0.030', '-0.030', '-0.031', '-0.016', '0.003', '0.014', '0.005', '0.010']
-
-lor_proj | final_projections.lor_os_r.weight
--0.036, 0.036, -0.000, 0.019, ['-0.009', '-0.010', '0.001', '0.013', '-0.019', '0.030', '0.013', '0.005', '-0.032', '0.027']
-
-lor_proj | final_projections.lor_gs_l.weight
--0.035, 0.035, -0.000, 0.019, ['-0.017', '0.004', '-0.004', '-0.026', '-0.021', '0.028', '0.032', '0.007', '0.031', '0.010']
-
-lor_proj | final_projections.lor_gs_r.weight
--0.035, 0.035, 0.000, 0.019, ['-0.026', '-0.003', '-0.013', '0.017', '-0.001', '0.020', '-0.028', '0.029', '0.007', '0.006']
-
-lor_proj | final_projections.lor_us_l.weight
--0.033, 0.033, -0.000, 0.019, ['-0.015', '0.001', '0.021', '0.033', '0.001', '0.014', '0.010', '-0.002', '0.033', '0.031']
-
-lor_proj | final_projections.lor_us_r.weight
--0.035, 0.035, 0.000, 0.019, ['-0.025', '0.021', '0.025', '0.005', '0.006', '-0.012', '0.017', '-0.019', '-0.021', '-0.032']
-
-lor_proj | final_projections.lor_ds_l.weight
--0.037, 0.037, -0.000, 0.019, ['0.011', '0.013', '0.019', '-0.018', '0.009', '-0.019', '-0.034', '0.017', '0.023', '0.015']
-
-lor_proj | final_projections.lor_ds_r.weight
--0.033, 0.033, -0.000, 0.019, ['-0.021', '-0.021', '0.019', '-0.027', '-0.017', '-0.033', '-0.010', '0.010', '0.009', '-0.021']
-
-
-
-lor_qs | norm.weight
-0.009, 0.011, 0.010, 0.000, ['0.010', '0.010', '0.010', '0.010', '0.010', '0.010', '0.010', '0.010', '0.010', '0.010']
-
-lor_ks | norm.weight
-0.009, 0.011, 0.010, 0.000, ['0.010', '0.011', '0.011', '0.010', '0.010', '0.010', '0.010', '0.010', '0.010', '0.010']
-
-lor_vs | norm.weight
-0.008, 0.012, 0.010, 0.001, ['0.010', '0.009', '0.010', '0.010', '0.010', '0.011', '0.010', '0.010', '0.009', '0.011']
-
-lor_os | norm.weight
-0.009, 0.015, 0.012, 0.001, ['0.012', '0.010', '0.012', '0.013', '0.010', '0.013', '0.010', '0.014', '0.012', '0.014']
-
-lor_gs | norm.weight
-0.008, 0.013, 0.010, 0.001, ['0.011', '0.011', '0.009', '0.011', '0.011', '0.009', '0.011', '0.010', '0.011', '0.010']
-
-lor_us | norm.weight
-0.008, 0.013, 0.010, 0.001, ['0.011', '0.011', '0.009', '0.011', '0.011', '0.009', '0.011', '0.011', '0.011', '0.010']
-
-lor_ds | norm.weight
-0.009, 0.016, 0.012, 0.001, ['0.012', '0.012', '0.011', '0.011', '0.011', '0.012', '0.012', '0.014', '0.010', '0.014']
-
-
-
-'''
