@@ -414,10 +414,19 @@ class Model(nn.Module):
         self.w2 = nn.Parameter(torch.randn(dim, dim))
         torch.nn.init.orthogonal_(self.w2)
 
-    def net(self, x):
-        x = torch.einsum('ed, ...d -> ...e', self.w1, x)
+        self.tags = nn.Parameter(torch.stack([
+            torch.randn(dim),  # l1
+            torch.randn(dim),  # r1
+            torch.randn(dim),  # l2
+            torch.randn(dim),  # r2
+            torch.randn(dim),  # query imgs
+        ], dim=0))
+        torch.nn.init.orthogonal_(self.tags)
+
+    def net(self, x, w1, w2):
+        x = torch.einsum('bed, bd -> be', w1, x)
         x = F.gelu(x)
-        x = torch.einsum('ed, ...d -> ...e', self.w2, x)
+        x = torch.einsum('bed, bd -> be', w2, x)
         return x
 
     def forward(self,
@@ -427,6 +436,7 @@ class Model(nn.Module):
                 inner_lr):
         B = query_w.shape[0]
         S = sxs.shape[1]
+        Q = qxs.shape[1]
 
         # embed inputs
         sxs    = self.img_in(sxs.view(-1, 1, img_dim, img_dim)).view(B, n_way * k_shot, -1)  # [B, S, D]
@@ -464,17 +474,66 @@ class Model(nn.Module):
 
             pass
 
+        l1e = self.tags[0]
+        r1e = self.tags[1]
+        l2e = self.tags[2]
+        r2e = self.tags[3]
 
-        w = 0
+        l1s = []
+        r1s = []
+        l2s = []
+        r2s = []
+
+        w1 = self.w1.unsqueeze(0).repeat(B, 1, 1)
+        w2 = self.w2.unsqueeze(0).repeat(B, 1, 1)
+
+        # Build up LORs based on Supports
         for six in range(S):
-            # w = w + self.net(torch.cat([sxs[:, six], sys_emb[:, six]], dim=1))
-            # w = w + self.net(sxs[:, six] * sys_emb[:, six])
-            w = w + torch.einsum('bd, be -> bde', self.net(sxs[:, six]), self.net(sys_emb[:, six]))
+            l1 = self.net(
+                sxs[:, six] *
+                sys_emb[:, six] + l1e,
+                w1, w2)
+            l1s.append(l1)
 
-        w = w.reshape(B, D, D)
+            r1 = self.net(
+                sxs[:, six] *
+                sys_emb[:, six] + r1e,
+                w1, w2)
+            r1s.append(r1)
 
-        y = torch.einsum('bde, bqd -> bqe', w, qxs)
-        pred_labels = torch.einsum('ld, bqd -> bql', self.emb, y)
+            l2 = self.net(
+                sxs[:, six] *
+                sys_emb[:, six] + l2e,
+                w1, w2)
+            l2s.append(l2)
+
+            r2 = self.net(
+                sxs[:, six] *
+                sys_emb[:, six] + r2e,
+                w1, w2)
+            r2s.append(r2)
+
+
+        # Apply LORs
+        qw1 = w1 + torch.einsum(
+            'bsl, bsr -> blr',
+            torch.stack(l1s, dim=1),
+            torch.stack(r1s, dim=1),
+        )
+
+        qw2 = w2 + torch.einsum(
+            'bsl, bsr -> blr',
+            torch.stack(l2s, dim=1),
+            torch.stack(r2s, dim=1),
+        )
+
+        # Use LORs on query images
+        pred_embs = []
+        for qix in range(Q):
+            pred = self.net(qxs[:, qix], qw1, qw2)
+            pred_embs.append(pred)
+        pred_embs = torch.stack(pred_embs, dim=1)
+        pred_labels = torch.einsum('ld, bqd -> bql', self.emb, pred_embs)
 
         # l1 = torch.einsum('de, be -> bd', self.w1.weight, query_w)
         # r1 = torch.einsum('de, bd -> be', self.w1.weight, query_w)
@@ -482,23 +541,24 @@ class Model(nn.Module):
         # l1 = self.w1(sxs).mean(dim=1)
         # r1 = self.w1(sys_emb).mean(dim=1)
 
-        l1 = (sxs).mean(dim=1)
-        r1 = (sys_emb).mean(dim=1)
+        # l1 = (sxs).mean(dim=1)
+        # r1 = (sys_emb).mean(dim=1)
 
-        assert pred_labels.shape[0] == B
-        assert pred_labels.shape[1] == qys.shape[1]
-        assert pred_labels.shape[2] == n_way
+        # assert pred_labels.shape[0] == B
+        # assert pred_labels.shape[1] == qys.shape[1]
+        # assert pred_labels.shape[2] == n_way
 
-        w_recon = torch.einsum('bl, br -> blr', l1, r1)
-        w_loss = F.mse_loss(w_recon, model.w1.unsqueeze(0).repeat(B, 1, 1))
+        # w_recon = torch.einsum('bl, br -> blr', l1, r1)
+        # w_loss = F.mse_loss(w_recon, model.w1.unsqueeze(0).repeat(B, 1, 1))
 
         task_loss = F.cross_entropy(
             pred_labels.view(-1, n_way),
             qys.view(-1)
         )
 
-        loss = task_loss + alpha * w_loss
+        w_loss = torch.zeros(1, device=DEVICE, dtype=torch.float)
 
+        loss = task_loss + alpha * w_loss
 
         return loss, task_loss, w_loss
 
