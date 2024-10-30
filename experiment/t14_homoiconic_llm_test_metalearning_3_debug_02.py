@@ -16,7 +16,7 @@ torch.Size([13, 5, 3, 3])
 
 import os
 import math
-import sys
+# import sys
 import traceback
 import importlib
 import random
@@ -53,8 +53,8 @@ DEVICE = 'cuda'
 # Params
 
 img_dim = 28
-label_dim = 16
 D = 64
+label_dim = D
 
 
 # data
@@ -89,8 +89,16 @@ def batch_linear(input, weight, bias=None):
 ##########
 # SGD
 
-def sgd(params, grads, lr=0.01):
-    return [p - g * lr for p, g in zip(params, grads)]
+def sgd_init(params):
+    # just used to maintain call-signature parity with other optimizers
+    return []
+
+def sgd(params, grads, opt_state: List[Any], lr=0.01):
+    # opt_state is ignored. included to maintain signature parity with other optimizers
+    return (
+        [p - g * lr for p, g in zip(params, grads)],
+        []  # empty opt_state
+    )
 
 
 ##########
@@ -99,7 +107,8 @@ def sgd(params, grads, lr=0.01):
 def sgd_momentum_init(params):
     return [torch.zeros_like(p) for p in params]
 
-def sgd_momentum(params, grads, velocity, lr=0.01, momentum=0.9):
+def sgd_momentum(params, grads, opt_state: List[Any], lr=0.01, momentum=0.9):
+    velocity = opt_state[0]
     updated_velocity = [momentum * v + lr * g for v, g in zip(velocity, grads)]
     updated_params = [p - v for p, v in zip(params, updated_velocity)]
     return updated_params, updated_velocity
@@ -111,7 +120,8 @@ def sgd_momentum(params, grads, velocity, lr=0.01, momentum=0.9):
 def rmsprop_init(params):
     return [torch.zeros_like(p) for p in params]  # square averages
 
-def rmsprop(params, grads, square_avg, lr=0.01, alpha=0.99, eps=1e-8):
+def rmsprop(params, grads, opt_state: List[Any], lr=0.01, alpha=0.99, eps=1e-8):
+    square_avg = opt_state[0]
     updated_square_avg = [alpha * avg + (1 - alpha) * g.pow(2) for avg, g in zip(square_avg, grads)]
     updated_params = [p - lr * g / (avg.sqrt() + eps)
                       for p, g, avg in zip(params, grads, updated_square_avg)]
@@ -128,7 +138,8 @@ def adam_init(params):
         0  # t
     )
 
-def adam(params, grads, m, v, t, lr=0.001, betas=(0.9, 0.999), eps=1e-8):
+def adam(params, grads, opt_state, lr=0.001, betas=(0.9, 0.999), eps=1e-8):
+    m, v, t = opt_state
     t += 1
     updated_m = [betas[0] * m_i + (1 - betas[0]) * g
                  for m_i, g in zip(m, grads)]
@@ -154,7 +165,7 @@ def adamax_init(params):
         0  # t (timestep)
     )
 
-def adamax(params, grads, m, u, t, lr=0.002, betas=(0.9, 0.999), eps=1e-8):
+def adamax(params, grads, opt_state, lr=0.002, betas=(0.9, 0.999), eps=1e-8):
     """
     Implements Adamax optimization algorithm (a variant of Adam based on infinity norm).
 
@@ -171,6 +182,7 @@ def adamax(params, grads, m, u, t, lr=0.002, betas=(0.9, 0.999), eps=1e-8):
     Returns:
         (updated_params, updated_m, updated_u, t)
     """
+    m, u, t = opt_state
     t += 1
 
     # Update biased first moment estimate
@@ -204,7 +216,8 @@ global_epoch = 0
 num_epochs = 1000
 lr = 1e-4
 wd = 1e-2
-alpha = 1e-3  # scale of weight_loss loss
+alpha = 1e-1  # scale of weight_loss loss
+
 
 ##########
 # Dataset
@@ -225,7 +238,6 @@ except:
         seed_test=2,
     )
     already_loaded = True
-
 
    #  # TODO: remove hack. The omniglot dataset has separate train/test splits,
    #  # but if I want random label pairings, but keep the same alphabet across
@@ -384,15 +396,11 @@ class Model(nn.Module):
         super().__init__()
         self.dim = dim
 
-        # Project In
-        self.w_in = nn.Sequential(
-            nn.Linear(dim, dim, bias=False)
-        )
-
         self.img_in = nn.Sequential(
             nn.Conv2d(in_channels=1, out_channels=8, kernel_size=3, stride=1, padding=1), nn.GELU(), nn.AdaptiveAvgPool2d((16, 16)), nn.BatchNorm2d(8),
             nn.Conv2d(in_channels=8, out_channels=16, kernel_size=3, stride=1, padding=1), nn.GELU(), nn.AdaptiveAvgPool2d((8, 8)), nn.BatchNorm2d(16),
             nn.Conv2d(in_channels=16, out_channels=1, kernel_size=3, stride=1, padding=1), nn.GELU(), nn.AdaptiveAvgPool2d((8, 8)), nn.BatchNorm2d(1),
+
             nn.Flatten(1, -1),
             nn.Dropout(0.2),
             nn.Linear(8 ** 2, dim, bias=False),
@@ -400,88 +408,99 @@ class Model(nn.Module):
         self.emb = nn.Parameter(torch.randn(n_way, label_dim))
         torch.nn.init.orthogonal_(self.emb)
 
-        # Trunk
         self.w1 = nn.Parameter(torch.randn(dim, dim))
-        torch.nn.init.xavier_normal_(self.w1)
+        torch.nn.init.orthogonal_(self.w1)
 
-        # Project Out
-        self.w_out = nn.Linear(dim, 2 * dim, bias=False)
+        self.w2 = nn.Parameter(torch.randn(dim, dim))
+        torch.nn.init.orthogonal_(self.w2)
 
-    def forward(self, query_w, xs, targets, query, inner_lr):
+    def net(self, x):
+        x = torch.einsum('ed, ...d -> ...e', self.w1, x)
+        x = F.gelu(x)
+        x = torch.einsum('ed, ...d -> ...e', self.w2, x)
+        return x
+
+    def forward(self,
+                query_w,
+                sxs, sys,  # support xs/ys
+                qxs, qys,  # query xs/ys
+                inner_lr):
         B = query_w.shape[0]
-        query_w = F.gelu(self.w_in(query_w))  # [B, D]
+        S = sxs.shape[1]
 
-        xs    = self.img_in(xs.view(-1, 1, img_dim, img_dim)).view(B, n_way * k_shot, -1)  # [B, S, D]
-        query = self.img_in(query.view(-1, 1, img_dim, img_dim)).view(B, n_way * q_query, -1)  # [B, Q, D]
-        target_emb = self.emb[targets]
+        # embed inputs
+        sxs    = self.img_in(sxs.view(-1, 1, img_dim, img_dim)).view(B, n_way * k_shot, -1)  # [B, S, D]
+        sys_emb = self.emb[sys]
 
-        with torch.enable_grad():
-            opt_state = None
-            w = (self.w1.unsqueeze(0).repeat(B, 1, 1) + 0).requires_grad_()
+        # embed outputs
+        qxs = self.img_in(qxs.view(-1, 1, img_dim, img_dim)).view(B, n_way * q_query, -1)  # [B, Q, D]
+        qys_emb = self.emb[qys]
 
-            for _ in range(N_LOOPS):
-                # pass images through w
-                pxs = torch.einsum('bed, bnd -> bne', w, xs)
-                # build outer pdt
-                op = torch.einsum('bsd, bse -> bde', pxs, target_emb)  # outer pdt of images and labels
+        # with torch.enable_grad():
+        #     opt_state = None
+        #     w = (self.w1.unsqueeze(0).repeat(B, 1, 1) + 0).requires_grad_()
+        if False:
+            # for _ in range(N_LOOPS):
+            #     # pass images through w
+            #     pxs = torch.einsum('bed, bnd -> bne', w, sxs)
+            #     # build outer pdt
+            #     op = torch.einsum('bsd, bse -> bde', pxs, sys_emb)  # outer pdt of images and labels
 
-                # pass images through outer pdt
-                pred_labels = torch.einsum('bde, bnd -> bne', op, pxs)
+            #     # pass images through outer pdt
+            #     pred_labels = torch.einsum('bde, bnd -> bne', op, pxs)
 
-                # predict label
-                pred_labels = torch.einsum('ld, bnd -> bnl', self.emb, pred_labels)
-                loss = F.cross_entropy(
-                    pred_labels.view(-1, n_way),
-                    targets.view(-1)
-                )
-                grads = torch.autograd.grad(loss, w, create_graph=True)
+            #     # predict label
+            #     pred_labels = torch.einsum('ld, bnd -> bnl', self.emb, pred_labels)
+            #     loss = F.cross_entropy(
+            #         pred_labels.view(-1, n_way),
+            #         sys.view(-1)
+            #     )
+            #     grads = torch.autograd.grad(loss, w, create_graph=True)
 
-                # Optimizer init
-                if opt_state is None:
-                    match INNER_OPT:
-                        case 'sgd_momentum':
-                            opt_state = sgd_momentum_init(w)
-                        case 'rmsprop':
-                            opt_state = rmsprop_init(w)
-                        case 'adam':
-                            opt_state = adam_init(w)
-                        case 'adamax':
-                            opt_state = adamax_init(w)
+            # opt_state = opt_state_fn(w)
+            # new_params, opt_state = opt_fn(w, grads, opt_state, lr=inner_lr)
 
-                # Optimization step
-                match INNER_OPT:
-                    case 'sgd':
-                        new_params = sgd(w, grads, lr=inner_lr)
-                    case 'sgd_momentum':
-                        new_params, opt_state = sgd_momentum(w, grads, opt_state, lr=inner_lr)
-                    case 'rmsprop':
-                        new_params, opt_state = rmsprop(w, grads, opt_state, lr=inner_lr)
-                    case 'adam':
-                        new_params, *opt_state = adam(w, grads, *opt_state, lr=inner_lr)
-                    case 'adamax':
-                        new_params, *opt_state = adamax(w, grads, *opt_state, lr=inner_lr)
+            #     w = new_params[0]
 
-                w = new_params[0]
+            pass
 
-        # pass support images through w
-        pxs = torch.einsum('bed, bnd -> bne', w, xs)
 
-        # build outer pdt
-        op = torch.einsum('bsd, bse -> bde', pxs, target_emb)  # outer pdt of images and labels
+        w = 0
+        for six in range(S):
+            # w = w + self.net(torch.cat([sxs[:, six], sys_emb[:, six]], dim=1))
+            # w = w + self.net(sxs[:, six] * sys_emb[:, six])
+            w = w + torch.einsum('bd, be -> bde', self.net(sxs[:, six]), self.net(sys_emb[:, six]))
 
-        # pass query images through w
-        qxs = torch.einsum('bed, bnd -> bne', w, query)
+        w = w.reshape(B, D, D)
 
-        # pass images through outer pdt
-        pred_labels = torch.einsum('bde, bnd -> bne', op, qxs)
+        y = torch.einsum('bde, bqd -> bqe', w, qxs)
+        pred_labels = torch.einsum('ld, bqd -> bql', self.emb, y)
 
-        # predict label
-        pred_labels = torch.einsum('ld, bnd -> bnl', self.emb, pred_labels)
+        # l1 = torch.einsum('de, be -> bd', self.w1.weight, query_w)
+        # r1 = torch.einsum('de, bd -> be', self.w1.weight, query_w)
 
-        # self modeling
-        ow = self.w_out(query_w)  # out weights
-        l1, r1 = torch.split(ow, [D, D], dim=1)
-        return pred_labels, l1, r1
+        # l1 = self.w1(sxs).mean(dim=1)
+        # r1 = self.w1(sys_emb).mean(dim=1)
+
+        l1 = (sxs).mean(dim=1)
+        r1 = (sys_emb).mean(dim=1)
+
+        assert pred_labels.shape[0] == B
+        assert pred_labels.shape[1] == qys.shape[1]
+        assert pred_labels.shape[2] == n_way
+
+        w_recon = torch.einsum('bl, br -> blr', l1, r1)
+        w_loss = F.mse_loss(w_recon, model.w1.unsqueeze(0).repeat(B, 1, 1))
+
+        task_loss = F.cross_entropy(
+            pred_labels.view(-1, n_way),
+            qys.view(-1)
+        )
+
+        loss = task_loss + alpha * w_loss
+
+
+        return loss, task_loss, w_loss
 
 
 
@@ -495,22 +514,36 @@ INNER_OPT = 'sgd_momentum'
 # INNER_OPT = 'adam'
 # INNER_OPT = 'adamax'
 
+
+
+
+
 match INNER_OPT:
     case 'sgd':
         INNER_LR = 1.0  # SGD-momentum needs much higher lr
         N_LOOPS = 20
+        opt_state_fn = sgd_init
+        opt_fn = sgd
     case 'sgd_momentum':
         INNER_LR = 0.1  # SGD-momentum needs much higher lr
         N_LOOPS = 5
+        opt_state_fn = sgd_momentum_init
+        opt_fn = sgd_momentum
     case 'rmsprop':
         INNER_LR = 1e-1
         N_LOOPS = 20
+        opt_state_fn = rmsprop_init
+        opt_fn = rmsprop
     case 'adam':
         INNER_LR = 1e-1
         N_LOOPS = 20
+        opt_state_fn = adam_init
+        opt_fn = adam
     case 'adamax':
         INNER_LR = 1e-2
         N_LOOPS = 20
+        opt_state_fn = adamax_init
+        opt_fn = adamax
 
 
 model = Model(D, img_dim).to(DEVICE)
@@ -547,20 +580,7 @@ def run_epoch(model, dataloader, inner_lr, optimizer, device, train=True):
             B = support_imgs.shape[0]
             query_w = torch.randn((B, D)).to(DEVICE)
 
-            predicted_labels, l1, r1 = model(query_w, support_imgs, support_labels, query_imgs, inner_lr)
-            assert predicted_labels.shape[0] == B
-            assert predicted_labels.shape[1] == query_labels.shape[1]
-            assert predicted_labels.shape[2] == n_way
-
-            w_recon = torch.einsum('bl, br -> blr', l1, r1)
-            w_loss = F.mse_loss(w_recon, model.w1.unsqueeze(0).repeat(B, 1, 1))
-
-            task_loss = F.cross_entropy(
-                predicted_labels.view(-1, n_way),
-                query_labels.view(-1)
-            )
-
-            loss = task_loss + alpha * w_loss
+            loss, task_loss, w_loss = model(query_w, support_imgs, support_labels, query_imgs, query_labels, inner_lr)
 
             if torch.isnan(loss):
                 print('NaN encountered:')
@@ -676,7 +696,7 @@ if False:
         x = vectors.unsqueeze(1)
 
         # Apply convolution with padding to maintain size
-        blurred = F.conv1d(x, kernel, padding=kernel.size(-1)//2)
+        blurred = F.conv1d(x, kernel, padding=kernel.size(-1) // 2)
 
         # Remove channel dim
         return blurred.squeeze(1)
