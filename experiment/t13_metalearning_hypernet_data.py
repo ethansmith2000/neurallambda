@@ -312,9 +312,11 @@ if False:
 
 ##############################
 
+
 class NShotTaskSampler(IterableDataset):
     """
     A sampler that creates N-way K-shot tasks for few-shot learning.
+    Tasks are pre-generated during initialization for deterministic sampling.
 
     Args:
         dataset (Dataset): The dataset to sample from.
@@ -322,9 +324,10 @@ class NShotTaskSampler(IterableDataset):
         k_shot (int): Number of support examples per class.
         q_query (int): Number of query examples per class.
         num_tasks (int): Number of tasks to generate.
+        seed (int, optional): Random seed for reproducibility. Defaults to 42.
     """
 
-    def __init__(self, dataset, n_way, k_shot, q_query, num_tasks):
+    def __init__(self, dataset, n_way, k_shot, q_query, num_tasks, seed):
         self.dataset = dataset
         self.n_way = n_way
         self.k_shot = k_shot
@@ -332,13 +335,29 @@ class NShotTaskSampler(IterableDataset):
         self.num_tasks = num_tasks
         self.labels = [item['label'] for item in dataset.dataset]
 
-    def __iter__(self):
-        for _ in range(self.num_tasks):
-            yield self.sample_task()
+        # Pre-generate all tasks
+        random.seed(seed)
+        self.tasks = [self._generate_task() for _ in range(self.num_tasks)]
 
-    def sample_task(self) -> Tuple[List, List]:
+        # Reset random seed to not affect other randomness in the program
+        random.seed()
+
+        self._task_index = 0
+
+    def __iter__(self):
+        self._task_index = 0
+        return self
+
+    def __next__(self):
+        if self._task_index >= self.num_tasks:
+            raise StopIteration
+        task = self.tasks[self._task_index]
+        self._task_index += 1
+        return task
+
+    def _generate_task(self) -> Tuple[List, List]:
         """
-        Sample a single N-way K-shot task.
+        Generate a single N-way K-shot task.
 
         Returns:
             Tuple containing support set and query set.
@@ -349,6 +368,7 @@ class NShotTaskSampler(IterableDataset):
         query_set = []
         class_ixs = list(range(len(classes)))
         random.shuffle(class_ixs)
+
         for class_ix, class_label in zip(class_ixs, classes):
             class_instances = [i for i, label in enumerate(self.labels) if label == class_label]
             selected_instances = random.sample(class_instances, self.k_shot + self.q_query)
@@ -368,7 +388,9 @@ def omniglot_n_way_k_shot(
     q_query: int,
     num_tasks: int,
     image_size: int,
-    batch_size: int
+    batch_size: int,
+    seed_train: int,
+    seed_test: int
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Create DataLoaders for N-way K-shot tasks on the Omniglot dataset.
@@ -396,8 +418,8 @@ def omniglot_n_way_k_shot(
     """
     train_dataset, test_dataset = omniglot_datasets(train_alphabets, test_alphabets, image_size)
 
-    train_sampler = NShotTaskSampler(train_dataset, n_way, k_shot, q_query, num_tasks)
-    test_sampler = NShotTaskSampler(test_dataset, n_way, k_shot, q_query, num_tasks)
+    train_sampler = NShotTaskSampler(train_dataset, n_way, k_shot, q_query, num_tasks, seed=seed_train)
+    test_sampler = NShotTaskSampler(test_dataset, n_way, k_shot, q_query, num_tasks, seed=seed_test)
 
     train_loader = DataLoader(train_sampler, batch_size=batch_size)
     test_loader = DataLoader(test_sampler, batch_size=batch_size)

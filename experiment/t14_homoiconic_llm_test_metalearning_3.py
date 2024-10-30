@@ -63,6 +63,7 @@ DESIGN CHOICES:
 - targeted LOR_LAYER
 
 TODO:
+- [ ] Add labels to INPUT
 - [ ] optimize metaweights instead of LORProjected metaweights
 - [ ] learnable inner loop lrs (perhaps different lrs per step)
 - [ ] increase metaweight rank
@@ -80,6 +81,19 @@ TODO:
 - options
   1. [ ] keep model frozen, only train LORProject
   2. [ ] use metalearned tokens in outerloop, and train entire model
+
+
+EXPERIMENT SEQUENCE:
+0. [ ] Overfit Simple Arch on 1 & Multi task
+0. [ ] Overfit Simple Arch + Conv Encoder on 1 & Multi task
+0. [ ] No LOR, overfit 1 task
+1. [ ] No LOR, can bare transformer overfit training data?
+2. [ ] LOR, but loss = equivalent in context loss (no query used)
+3. [ ] LOR, Sham query without reordering
+4. [ ] LOR, Sham with fixed reordering
+5. [ ] LOR, Sham with random reordering
+6. [ ] LOR, Query version
+
 
 '''
 
@@ -128,7 +142,9 @@ random.seed(SEED)
 DEVICE = 'cuda'
 WHICH_LOR = 1
 N_METAWEIGHTS = 14  # QKVOGUD * 2
-LOR_LAYER = 2  # target of LOR stuff
+
+LOR_LAYERS = [1, 2, 3, 4, 5]  # targets of LOR stuff
+# LOR_LAYERS = [2]  # targets of LOR stuff
 
 
 ##################################################
@@ -137,21 +153,6 @@ LOR_LAYER = 2  # target of LOR stuff
 model_name = os.path.expanduser("~/_/models/Qwen2-0.5B")
 # model_name = os.path.expanduser("~/_/models/Qwen2-1.5B")
 # model_name = os.path.expanduser("~/_/models/Qwen2-7B")
-
-def hook_fn(module, input, output):
-    if isinstance(output, torch.Tensor):
-        isnan = torch.isnan(output).any()
-        isinf = torch.isinf(output).any()
-        if isnan or isinf:
-            print('\n' * 3)
-            print(f"NaN or inf detected in {module.__class__.__name__}: isnan:{isnan.item()}, isinf{isinf.item()}")
-            print(f"Module: {module}")
-            print(f"Module name: {module_names.get(module, 'Unknown')}")
-            print(f"Input shape: {[i.shape if isinstance(i, torch.Tensor) else type(i) for i in input]}")
-            print(f"Output shape: {output.shape}")
-            breakpoint()
-            # raise RuntimeError("NaN or inf detected: {isnan=}, {isinf=}")
-
 
 def hook_fn(module, input, output):
     if isinstance(output, torch.Tensor):
@@ -245,20 +246,21 @@ except:
     add_hooks(model)
     already_loaded = True
 
+DO_TRUNCATE = True
 
-if True:
+if DO_TRUNCATE:
     warnings.warn('TRUNCATING MODEL LAYERS')
     model.model.layers = model.model.layers[0:3] + model.model.layers[-3:]
     for ix in range(len(model.model.layers)):
         model.model.layers[ix].layer_idx = ix
         model.model.layers[ix].self_attn.layer_idx = ix
 
-if True:
+if DO_TRUNCATE:
     warnings.warn('TRUNCATING MODEL EMBEDDINGS')
 
     assert id(model.lm_head.weight) == id(model.model.embed_tokens.weight), 'model does not have tied weights, but truncation expects it'
 
-    TRUNCATE_EMB_SIZE = 1000
+    TRUNCATE_EMB_SIZE = 1000  # truncate vocabulary
 
     new_embs = nn.Parameter(
         model.model.embed_tokens.weight[:TRUNCATE_EMB_SIZE].clone(),
@@ -440,6 +442,8 @@ reference the current lor cache. This is where they get it from.'''
 # ):
 #     ''' Update the LORs by interpreting hidden states as new lor blocks '''
 
+#     new_cache = empty_lors(num_layers)
+
 #     # check that lor_models and lor_cache are defined (at least None values)
 #     # for each layer, and that there's a model for every cache key
 #     lor_keys = lor_cache.keys()
@@ -482,26 +486,13 @@ reference the current lor cache. This is where they get it from.'''
 
 #         # update cache
 #         for k, (l, r) in zip(lor_keys, proj_pairs):
-#             if lor_cache[k][layer_ix] is None:  # is first pass, no cache yet
-#                 lor_cache[k][layer_ix] = (l.unsqueeze(2), r.unsqueeze(2))  # [B, DIM, RANK]
+#             if new_cache[k][layer_ix] is None:  # is first pass, no cache yet
+#                 new_cache[k][layer_ix] = (l.unsqueeze(2), r.unsqueeze(2))  # [B, DIM, RANK]
 #             else:
-#                 lor_cache[k][layer_ix] = (torch.cat([lor_cache[k][layer_ix][0], l.unsqueeze(2)], dim=2),
-#                                           torch.cat([lor_cache[k][layer_ix][1], r.unsqueeze(2)], dim=2))  # [B, DIM, RANK]
+#                 new_cache[k][layer_ix] = (torch.cat([new_cache[k][layer_ix][0], l.unsqueeze(2)], dim=2),
+#                                           torch.cat([new_cache[k][layer_ix][1], r.unsqueeze(2)], dim=2))  # [B, DIM, RANK]
 
-#     return lor_cache
-
-# def build_parses(lor_ixs_per_layer, hidden_states, num_layers):
-#     '''
-#     returns a dictionary shaped like `empty_lor_cache` where each key has a list with an entry per layer, and that entry contains a tuple of the left and right parses
-#     '''
-#     pass
-
-# def apply_lor_models(parses, lor_models, lor_cache):
-#     '''
-#     apply lor_models to the output of `build_parases`
-#     '''
-#     pass
-
+#     return new_cache
 
 
 
@@ -531,7 +522,7 @@ def build_parses(lor_ixs_per_layer, hidden_states, num_layers):
         # validate spans
         assert isinstance(lor_ix_spans, torch.Tensor)
         assert lor_ix_spans.min() >= -1
-        assert lor_ix_spans.max() <= hidden_states[-1].shape[1]
+        assert lor_ix_spans.max() <= hidden_states.shape[1]
 
         # select spans for this layer
         parses = select_spans(hidden_states, lor_ix_spans)
@@ -544,7 +535,7 @@ def build_parses(lor_ixs_per_layer, hidden_states, num_layers):
 
     return parses_dict
 
-def apply_lor_models(parses, lor_models, lor_cache):
+def apply_lor_models(parses, lor_models, lor_cache, num_layers):
     '''
     Apply LOR models to parsed representations and update the cache.
 
@@ -557,13 +548,14 @@ def apply_lor_models(parses, lor_models, lor_cache):
         dict: Updated LOR cache
     '''
     # validate input structures
-    lor_keys = lor_cache.keys()
-    num_layers = len(lor_cache[next(iter(lor_keys))])
+    lor_keys = list(lor_cache.keys())
 
     for k in lor_keys:
         assert (
             len(lor_models[k]) == len(lor_cache[k]) == num_layers
         ), f"Mismatched lengths: lor_models[{k}]={len(lor_models[k])}, lor_cache[{k}]={len(lor_cache[k])}, num_layers={num_layers}"
+
+    new_cache = empty_lors(num_layers)  # to not mutate `lor_cache`
 
     # process each layer
     for layer_ix in range(num_layers):
@@ -578,15 +570,15 @@ def apply_lor_models(parses, lor_models, lor_cache):
 
         # update cache for each key
         for k, (l, r) in zip(lor_keys, proj_pairs):
-            if lor_cache[k][layer_ix] is None:
-                lor_cache[k][layer_ix] = (l.unsqueeze(2), r.unsqueeze(2))  # [B, DIM, RANK]
+            if new_cache[k][layer_ix] is None:
+                new_cache[k][layer_ix] = (l.unsqueeze(2), r.unsqueeze(2))  # [B, DIM, RANK]
             else:
-                lor_cache[k][layer_ix] = (
-                    torch.cat([lor_cache[k][layer_ix][0], l.unsqueeze(2)], dim=2),
-                    torch.cat([lor_cache[k][layer_ix][1], r.unsqueeze(2)], dim=2)
+                new_cache[k][layer_ix] = (
+                    torch.cat([new_cache[k][layer_ix][0], l.unsqueeze(2)], dim=2),
+                    torch.cat([new_cache[k][layer_ix][1], r.unsqueeze(2)], dim=2)
                 )  # [B, DIM, RANK]
 
-    return lor_cache
+    return new_cache
 
 # def update_lors(lor_models, lor_cache, lor_ixs_per_layer, hidden_states, num_layers):
 #     ''' Update the LORs by interpreting hidden states as new lor blocks '''
@@ -600,6 +592,7 @@ def apply_lor_models(parses, lor_models, lor_cache):
 
 
 
+# START_BLOCK_5
 
 def select_spans(x, indices):
     """Selects spans from a 3D tensor (`[batch, seq, dim]`) along dim=1 using
@@ -628,10 +621,8 @@ def select_spans(x, indices):
         >>> indices = torch.tensor([[1, 2], [-1, -1]])
         >>> select_spans(x, indices)
         tensor([[[ 4,  5,  6],
-                 [ 7,  8,  9],
-                 [ 0,  0,  0]],
+                 [ 7,  8,  9]],
                 [[ 0,  0,  0],
-                 [ 0,  0,  0],
                  [ 0,  0,  0]]])
     """
     B, S, D = x.shape  # batch, sequence length, dimension
@@ -665,6 +656,15 @@ def select_spans(x, indices):
     gathered_values[final_mask] = x[valid_batch_indices, valid_abs_indices]
 
     return gathered_values
+
+# B = 3
+# S = 5
+# D = 1
+# x = torch.arange(B * S * D).reshape(B, S, D)
+# indices = torch.tensor([[1, 4], [-1, -1], [0, 3]])
+# print(select_spans(x, indices))
+
+# END_BLOCK_5
 
 
 
@@ -767,9 +767,9 @@ class LORProject(nn.Module):
             nn.RMSNorm(N_METAWEIGHTS),
             nn.Linear(N_METAWEIGHTS, self.token_mixing_dim, bias=False),
             nn.GELU(),
-            nn.Dropout(dropout_rate),
+            # nn.Dropout(dropout_rate),
             nn.Linear(self.token_mixing_dim, n_out, bias=False),
-            nn.Dropout(dropout_rate),
+            # nn.Dropout(dropout_rate),
         )
 
         # Channel-mixing MLP (same for all inputs)
@@ -777,9 +777,9 @@ class LORProject(nn.Module):
             nn.RMSNorm(dim),
             nn.Linear(dim, self.channel_mixing_dim, bias=False),
             nn.GELU(),
-            nn.Dropout(dropout_rate),
+            # nn.Dropout(dropout_rate),
             nn.Linear(self.channel_mixing_dim, dim, bias=False),
-            nn.Dropout(dropout_rate),
+            # nn.Dropout(dropout_rate),
         )
 
         # Final projection layers
@@ -821,21 +821,16 @@ class LORProject(nn.Module):
         device = x.device
 
         # Token-mixing
-        # residual = x
-
-        # x_token shape: [batch, dim, 14]
-        x_token = x.transpose(1, 2)
-        # Normalize across token dimension
+        residual = x
+        x_token = x.transpose(1, 2)  # [batch, dim, 14]
         x_token = self.token_mixing_mlp(x_token)
         x_token = x_token.transpose(1, 2)  # [batch, 14, dim]
-
-        # x = residual + x_token
+        x = residual + x_token
 
         # Channel-mixing
-        # residual = x
+        residual = x
         x = self.channel_mixing_mlp(x)
-
-        # x = residual + x
+        x = residual + x
 
         # ##########
         # # Don't tie intermediates
@@ -942,6 +937,186 @@ class LORProject(nn.Module):
 
 
 
+
+
+
+# # EXPERIMENT: local only projections, no Mixing
+# class LORProject(nn.Module):
+#     '''
+#     LOR weights need to be projected to fit the shapes of the underlying
+#     Linear layers they're matching. These LORModules solve this, and there
+#     are 2 modules per target linear layer, (left singular values, right
+#     singular values). They multiply like: out=LRx, to match the usual out=Wx,
+#     so the new calculation becomes out=Wx + LRx.
+
+#     R are the input vectors, and L are the output vectors. The first
+#     dimension of the LORModules must match the embedding that we're
+#     projecting, so the 1st values are all `dim`. The 2nd dim of R is the
+#     input dimension of the matched linear weights. The 2nd dim of L is the
+#     output dimension of the same linear layer.
+
+#     '''
+
+#     def __init__(self, dropout_rate=0.15):
+#         super().__init__()
+
+#         dim = model.model.embed_tokens.weight.shape[1]  # embedding dimension
+#         k_dim = model.model.layers[0].self_attn.k_proj.weight.shape[0]
+#         v_dim = model.model.layers[0].self_attn.v_proj.weight.shape[0]
+#         ff_dim = model.config.intermediate_size
+
+#         self.dim = dim
+#         self.k_dim = k_dim
+#         self.v_dim = v_dim
+#         self.ff_dim = ff_dim
+
+
+
+#         # # Final projection layers
+#         # self.final_projections = nn.ModuleDict({
+#         #     'lor_qs_l': nn.Linear(dim, dim, bias=False),
+#         #     'lor_qs_r': nn.Linear(dim, dim, bias=False),
+#         #     'lor_ks_l': nn.Linear(dim, k_dim, bias=False),
+#         #     'lor_ks_r': nn.Linear(dim, dim, bias=False),
+#         #     'lor_vs_l': nn.Linear(dim, v_dim, bias=False),
+#         #     'lor_vs_r': nn.Linear(dim, dim, bias=False),
+#         #     'lor_os_l': nn.Linear(dim, dim, bias=False),
+#         #     'lor_os_r': nn.Linear(dim, dim, bias=False),
+#         #     'lor_gs_l': nn.Linear(dim, ff_dim, bias=False),
+#         #     'lor_gs_r': nn.Linear(dim, dim, bias=False),
+#         #     'lor_us_l': nn.Linear(dim, ff_dim, bias=False),
+#         #     'lor_us_r': nn.Linear(dim, dim, bias=False),
+#         #     'lor_ds_l': nn.Linear(dim, dim, bias=False),
+#         #     'lor_ds_r': nn.Linear(dim, ff_dim, bias=False),
+#         # })
+
+
+
+#         # Final projection layers
+#         idim = 128
+#         self.final_projections = nn.ModuleDict({
+#             'lor_qs_l': nn.Sequential(nn.Linear(dim, idim, bias=False), nn.GELU(), nn.Linear(idim, dim, bias=False)),
+#             'lor_qs_r': nn.Sequential(nn.Linear(dim, idim, bias=False), nn.GELU(), nn.Linear(idim, dim, bias=False)),
+#             'lor_ks_l': nn.Sequential(nn.Linear(dim, idim, bias=False), nn.GELU(), nn.Linear(idim, k_dim, bias=False)),
+#             'lor_ks_r': nn.Sequential(nn.Linear(dim, idim, bias=False), nn.GELU(), nn.Linear(idim, dim, bias=False)),
+#             'lor_vs_l': nn.Sequential(nn.Linear(dim, idim, bias=False), nn.GELU(), nn.Linear(idim, v_dim, bias=False)),
+#             'lor_vs_r': nn.Sequential(nn.Linear(dim, idim, bias=False), nn.GELU(), nn.Linear(idim, dim, bias=False)),
+#             'lor_os_l': nn.Sequential(nn.Linear(dim, idim, bias=False), nn.GELU(), nn.Linear(idim, dim, bias=False)),
+#             'lor_os_r': nn.Sequential(nn.Linear(dim, idim, bias=False), nn.GELU(), nn.Linear(idim, dim, bias=False)),
+#             'lor_gs_l': nn.Sequential(nn.Linear(dim, idim, bias=False), nn.GELU(), nn.Linear(idim, ff_dim, bias=False)),
+#             'lor_gs_r': nn.Sequential(nn.Linear(dim, idim, bias=False), nn.GELU(), nn.Linear(idim, dim, bias=False)),
+#             'lor_us_l': nn.Sequential(nn.Linear(dim, idim, bias=False), nn.GELU(), nn.Linear(idim, ff_dim, bias=False)),
+#             'lor_us_r': nn.Sequential(nn.Linear(dim, idim, bias=False), nn.GELU(), nn.Linear(idim, dim, bias=False)),
+#             'lor_ds_l': nn.Sequential(nn.Linear(dim, idim, bias=False), nn.GELU(), nn.Linear(idim, dim, bias=False)),
+#             'lor_ds_r': nn.Sequential(nn.Linear(dim, idim, bias=False), nn.GELU(), nn.Linear(idim, ff_dim, bias=False)),
+#         })
+
+
+#         # LORModule must play nicely in a batch situation, where some samples
+#         # of the batch imply lor parses and others don't. Non LoR'd samples
+#         # should not be affected by sharing a batch with LoR'd samples. Biases
+#         # corrupt this property. 0-valued lors (from samples without lor
+#         # parses) must produce 0-valued outputs here. Checking for biases is
+#         # not the whole solution, you must take care.
+#         #
+#         # This is not necessarily necessary. For instance, clever masking of
+#         # non-parsed samples might obviate this.
+#         assert_no_biases(self)
+
+
+#     def forward(self, x):
+#         '''
+#         x: [B, N_METAWEIGHTS, D]
+#         '''
+#         B = x.shape[0]
+#         device = x.device
+
+#         # ##########
+#         # # Don't tie intermediates
+#         # outputs = (
+#         #     self.final_projections['lor_qs_l'](x[:, 0, :]),
+#         #     self.final_projections['lor_qs_r'](x[:, 1, :]),
+#         #     self.final_projections['lor_ks_l'](x[:, 2, :]),
+#         #     self.final_projections['lor_ks_r'](x[:, 3, :]),
+#         #     self.final_projections['lor_vs_l'](x[:, 4, :]),
+#         #     self.final_projections['lor_vs_r'](x[:, 5, :]),
+#         #     self.final_projections['lor_os_l'](x[:, 6, :]),
+#         #     self.final_projections['lor_os_r'](x[:, 7, :]),
+#         #     self.final_projections['lor_gs_l'](x[:, 8, :]),
+#         #     self.final_projections['lor_gs_r'](x[:, 9, :]),
+#         #     self.final_projections['lor_us_l'](x[:, 10, :]),
+#         #     self.final_projections['lor_us_r'](x[:, 11, :]),
+#         #     self.final_projections['lor_ds_l'](x[:, 12, :]),
+#         #     self.final_projections['lor_ds_r'](x[:, 13, :]),
+#         # )
+#         # return outputs
+
+
+#         ##########
+#         # Tie many intermediates. Adopting results from (ie, results from t14_homoiconic_llm_adding_data_to_mlp)
+
+#         ud_intermediate = torch.randn(B, self.ff_dim, device=device)
+#         kv_intermediate = torch.randn(B, self.k_dim, device=device)
+#         ou_intermediate = torch.randn(B, self.dim, device=device)
+
+#         outputs = (
+#             # self.final_projections['lor_qs_l'](x[:, 0, :]),
+#             torch.cat([kv_intermediate] * (self.dim // self.k_dim), dim=-1),
+
+#             self.final_projections['lor_qs_r'](x[:, 1, :]),
+
+#             # self.final_projections['lor_ks_l'](x[:, 2, :]),
+#             kv_intermediate,
+
+#             self.final_projections['lor_ks_r'](x[:, 3, :]),
+
+#             # self.final_projections['lor_vs_l'](x[:, 4, :]),
+#             kv_intermediate,
+
+#             self.final_projections['lor_vs_r'](x[:, 5, :]),
+
+#             # self.final_projections['lor_os_l'](x[:, 6, :]),
+#             ou_intermediate,
+
+#             self.final_projections['lor_os_r'](x[:, 7, :]),
+
+#             self.final_projections['lor_gs_l'](x[:, 8, :]),
+#             # ud_intermediate * -1,
+
+#             self.final_projections['lor_gs_r'](x[:, 9, :]),
+#             # ou_intermediate,
+
+#             # self.final_projections['lor_us_l'](x[:, 10, :]),
+#             ud_intermediate,  # replace lor_us_l
+
+#             # self.final_projections['lor_us_r'](x[:, 11, :]),
+#             ou_intermediate,
+
+#             self.final_projections['lor_ds_l'](x[:, 12, :]),
+
+#             # self.final_projections['lor_ds_r'](x[:, 13, :]),
+#             ud_intermediate,  # replace lor_ds_r
+#         )
+
+#         return outputs
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class LORNorm(nn.Module):
     def __init__(self, in_dim, out_dim, name):
         super().__init__()
@@ -1011,7 +1186,7 @@ class LORNorm(nn.Module):
 # Training
 
 
-def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, device, train=True, debug=False):
+def run_epoch(model, img_proj, lor_models, baked_metaweights, inner_lr, dataloader, optimizer, device, train=True, debug=False):
     model.train() if train else model.eval()
     total_loss = 0
     total_samples = 0
@@ -1063,13 +1238,6 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
             B, Ss = support_labels.shape  # batch size, sequence (N*k)
             Sq = query_labels.shape[1]  # N*q
 
-            # EXPERIMENT: random metaweights
-            metaweights = torch.randn(B, N_METAWEIGHTS, D, device=device) * 1e-3  # TODO: what should this init be?
-
-            # # EXPERIMENT: tokens for metaweights
-            # metatokens = torch.tensor(list(range(50, 64)), device=device, dtype=torch.long)
-            # metaweights = model.model.embed_tokens(metatokens).unsqueeze(0).repeat(B, 1, 1)
-
             img_attention_mask = torch.ones((B, Ss), device=device, dtype=torch.long)
             img_uncausal_mask = torch.ones_like(img_attention_mask, dtype=torch.bool)  # NOTE: whole sequence is uncausally masked
 
@@ -1080,6 +1248,26 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
             query_uncausal_mask = torch.ones_like(query_attention_mask, dtype=torch.bool)
 
 
+            # ##############################
+            # # SKIP LOR STUFF
+
+            # empty_lor_cache = empty_lors(model.config.num_hidden_layers)  # init lors for whole batch
+            # out = model(inputs_embeds=support_imgs,  # note: input_embeds, not input_ids
+            #             attention_mask=img_attention_mask,
+            #             uncausal_mask=None,  # img_uncausal_mask,
+            #             **empty_lor_cache,
+            #             )
+
+            # # calculate TRANSDUCTIVE loss, ie not autoregressive, ie don't offset logits/targets (and don't causal mask)
+            # logits = out.logits.contiguous().view(-1, vocab_size)  # note: not offset. just parses out img responses (not metaweights)
+            # target = support_labels.view(-1)
+            # loss = F.cross_entropy(logits, target)
+
+
+
+            #####
+            # Run supports and metaweights to populate lor_cache
+
             # span ixs of metaweights to parse out (inclusive span). currently
             # lor_ixs is only defined for LOR_LAYER, other spans are None.
             lor_ixs = torch.zeros(B, 2, dtype=torch.long, device=device)
@@ -1087,51 +1275,56 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
                 lor_ixs[:, 0] = Ss
                 lor_ixs[:, 1] = Ss + N_METAWEIGHTS - 1
 
-            lor_ixs_per_layer = (
-                [None] * LOR_LAYER +
-                [lor_ixs]  +
-                [None] * (num_layers - LOR_LAYER - 1)
-            )
-
-            #####
-            # Run supports and metaweights to populate lor_cache
-
+            lor_ixs_per_layer = [None] * num_layers
+            for lix in LOR_LAYERS:
+                lor_ixs_per_layer[lix] = lor_ixs
 
             # iterate over supports and do SGD on LoRs
             with torch.enable_grad():
                 opt_state = None  # will set first time this is needed
 
-                # First pass to collect LORS
-                empty_lor_cache = empty_lors(model.config.num_hidden_layers)  # init lors for whole batch
-                out = model(inputs_embeds=torch.cat([support_imgs, metaweights], dim=1),  # note: input_embeds, not input_ids
-                            attention_mask=torch.cat([img_attention_mask, meta_attention_mask], dim=1),
-                            return_dict=True,
-                            output_hidden_states=True,
-                            uncausal_mask=torch.cat([img_uncausal_mask, meta_uncausal_mask], dim=1),
-                            **empty_lor_cache,
-                            )
+                # # EXPERIMENT: baked in metaweight parameters
+                # metaweights = (baked_metaweights + 0).unsqueeze(0).repeat(B, 1, 1).requires_grad_()
+
+                # # EXPERIMENT: zero metaweights
+                # metaweights = torch.zeros(B, N_METAWEIGHTS, D, device=device)
+                # metaweights = metaweights.requires_grad_()
+
+                # # EXPERIMENT: random metaweights
+                # metaweights = torch.randn(B, N_METAWEIGHTS, D, device=device) * 1e-3  # TODO: what should this init be?
+                # metaweights = metaweights.requires_grad_()
 
 
-                # use final layers hidden states for LOR
-                parses = build_parses(lor_ixs_per_layer, out.hidden_states[-1], num_layers)
-                lor_cache = apply_lor_models(parses, lor_models, empty_lor_cache)
+                # EXPERIMENT: tokens for metaweights
+                metatokens = torch.tensor(list(range(50, 64)), device=device, dtype=torch.long)
+                metaweights = model.model.embed_tokens(metatokens).unsqueeze(0).repeat(B, 1, 1)
+
 
                 # N steps of metalearning
                 for i in range(N_LOOPS):
 
-                    # make sure lors require grads
-                    for k in lor_cache.keys():
-                        for lix in range(len(lor_cache[k])):
-                            if lor_cache[k][lix] is not None:
-                                lor_cache[k][lix] = [lor_cache[k][lix][0].requires_grad_(), lor_cache[k][lix][1].requires_grad_()]
+                    #####
+                    # First pass to collect LORS
+                    empty_lor_cache = empty_lors(model.config.num_hidden_layers)  # init lors for whole batch
+                    out = model(inputs_embeds=torch.cat([support_imgs, metaweights], dim=1),  # note: input_embeds, not input_ids
+                                attention_mask=torch.cat([img_attention_mask, meta_attention_mask], dim=1),
+                                return_dict=True,
+                                output_hidden_states=True,
+                                uncausal_mask=torch.cat([img_uncausal_mask, meta_uncausal_mask], dim=1),
+                                **empty_lor_cache,
+                                )
 
+
+                    # use final layers hidden states for LOR
+                    final = out.hidden_states[-1].requires_grad_()
+                    parses = build_parses(lor_ixs_per_layer, final, num_layers)  # layer-wise dict, all parsed metaweights cat'd together
+                    lor_cache = apply_lor_models(parses, lor_models, empty_lor_cache, num_layers)
                     lorm = partially_apply_models(lor_models, lor_cache)
 
+                    #####
                     # Second pass to train LORS
                     out = model(inputs_embeds=support_imgs,  # note: input_embeds, not input_ids
                                 attention_mask=img_attention_mask,
-                                return_dict=True,
-                                output_hidden_states=True,
                                 uncausal_mask=img_uncausal_mask,
                                 **lorm,
                                 )
@@ -1141,17 +1334,7 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
                     target = support_labels.view(-1)
                     loss = F.cross_entropy(logits, target)
 
-                    key_ixs = []  # [(lor_key, layer_ix)]
-                    params = []
-                    # flatten params to be used in optim
-                    for k in lor_cache.keys():
-                        for lix in range(len(lor_cache[k])):
-                            if lor_cache[k][lix] is not None:
-                                for tuple_ix in range(2):
-                                    key_ixs.append((k, lix, tuple_ix))
-                                    params.append(lor_cache[k][lix][tuple_ix].requires_grad_())
-
-                    grads = torch.autograd.grad(loss, params, create_graph=True)
+                    grads = torch.autograd.grad(loss, metaweights, create_graph=True)
 
                     # MAX_GRAD_NORM = 1.0
                     # grads = [g.renorm(2, dim=-1, maxnorm=MAX_GRAD_NORM) for g in grads]
@@ -1163,33 +1346,74 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
                     if opt_state is None:
                         match INNER_OPT:
                             case 'sgd_momentum':
-                                opt_state = sgd_momentum_init(params)
+                                opt_state = sgd_momentum_init(metaweights)
                             case 'rmsprop':
-                                opt_state = rmsprop_init(params)
+                                opt_state = rmsprop_init(metaweights)
                             case 'adam':
-                                opt_state = adam_init(params)
+                                opt_state = adam_init(metaweights)
                             case 'adamax':
-                                opt_state = adamax_init(params)
+                                opt_state = adamax_init(metaweights)
 
                     # Optimization step
                     match INNER_OPT:
                         case 'sgd':
-                            new_params = sgd(params, grads, lr=inner_lr)
+                            new_params = sgd(metaweights, grads, lr=inner_lr)
                         case 'sgd_momentum':
-                            new_params, opt_state = sgd_momentum(params, grads, opt_state, lr=inner_lr)
+                            new_params, opt_state = sgd_momentum(metaweights, grads, opt_state, lr=inner_lr)
                         case 'rmsprop':
-                            new_params, opt_state = rmsprop(params, grads, opt_state, lr=inner_lr)
+                            new_params, opt_state = rmsprop(metaweights, grads, opt_state, lr=inner_lr)
                         case 'adam':
-                            new_params, *opt_state = adam(params, grads, *opt_state, lr=inner_lr)
+                            new_params, *opt_state = adam(metaweights, grads, *opt_state, lr=inner_lr)
                         case 'adamax':
-                            new_params, *opt_state = adamax(params, grads, *opt_state, lr=inner_lr)
+                            new_params, *opt_state = adamax(metaweights, grads, *opt_state, lr=inner_lr)
 
-                    # replace lor_cache with trained version
-                    lor_cache = empty_lors(model.config.num_hidden_layers)
-                    for (k, lix, tuple_ix), p in zip(key_ixs, new_params):
-                        if lor_cache[k][lix] is None:
-                            lor_cache[k][lix] = [None, None]  # these will both be filled in
-                        lor_cache[k][lix][tuple_ix] = p
+                    metaweights = new_params[0]
+
+
+
+            #####
+            # SHAM QUERY, re-run support for final loss, which likely was memorized
+
+            lorm = partially_apply_models(lor_models, lor_cache)
+
+            SS = support_imgs.shape[1]
+            s_attention_mask = torch.ones(B, SS, device=device, dtype=torch.long)
+
+
+            # EXPERIMENT: always swap
+            swap_support_imgs = torch.stack([support_imgs[:, 1], support_imgs[:, 0]], dim=1)
+
+            # # EXPERIMENT: randomly swap order for entire batch
+            # # swap positions of support imgs (only works with N_way==2) so it can't just memorize output labels
+            # if random.random() > 0.5:
+            #     swap_support_imgs = torch.stack([support_imgs[:, 1], support_imgs[:, 0]], dim=1)
+            # else:
+            #     swap_support_imgs = support_imgs
+
+            # # EXPERIMENT: randomly swap per batch item
+            # # Assuming support_imgs has shape [batch_size, 2, ...]
+            # batch_size = support_imgs.shape[0]
+            # should_swap = torch.rand(batch_size) > 0.5  # Generate random boolean mask for each batch item
+            # should_swap = should_swap.view(-1, 1, *(1,) * (support_imgs.dim() - 2))  # Reshape for broadcasting
+            # # Create both possible orders and select based on the mask
+            # original = support_imgs
+            # swapped = torch.stack([support_imgs[:, 1], support_imgs[:, 0]], dim=1)
+            # swap_support_imgs = torch.where(should_swap, swapped, original)
+
+            query_out = model(
+                inputs_embeds=swap_support_imgs,
+                attention_mask=s_attention_mask,
+                uncausal_mask=img_uncausal_mask,
+                **lorm,
+            )
+            logits = query_out.logits[:, :Ss].contiguous().view(-1, vocab_size)  # [B, S-1, D] -> [B * (S-1), D]
+            target = support_labels.contiguous().view(-1)  # [B, S-1] -> [B * (S-1)]
+            qloss = F.cross_entropy(logits, target)
+            # final metalearning loss + query loss
+            # loss = loss + qloss
+            loss = qloss
+            #####
+
 
 
 
@@ -1217,52 +1441,7 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
 
 
 
-            #####
-            # SHAM QUERY, re-run support for final loss, which likely was memorized
 
-            lorm = partially_apply_models(lor_models, lor_cache)
-
-            SS = support_imgs.shape[1]
-            s_attention_mask = torch.ones(B, SS, device=device, dtype=torch.long)
-
-
-            # EXPERIMENT: always swap
-            swap_support_imgs = torch.stack([support_imgs[:, 1], support_imgs[:, 0]], dim=1)
-
-
-            # # EXPERIMENT: randomly swap order for entire batch
-            # # swap positions of support imgs (only works with N_way==2) so it can't just memorize output labels
-            # if random.random() > 0.5:
-            #     swap_support_imgs = torch.stack([support_imgs[:, 1], support_imgs[:, 0]], dim=1)
-            # else:
-            #     swap_support_imgs = support_imgs
-
-
-            # # EXPERIMENT: randomly swap per batch item
-            # # Assuming support_imgs has shape [batch_size, 2, ...]
-            # batch_size = support_imgs.shape[0]
-            # should_swap = torch.rand(batch_size) > 0.5  # Generate random boolean mask for each batch item
-            # should_swap = should_swap.view(-1, 1, *(1,) * (support_imgs.dim() - 2))  # Reshape for broadcasting
-            # # Create both possible orders and select based on the mask
-            # original = support_imgs
-            # swapped = torch.stack([support_imgs[:, 1], support_imgs[:, 0]], dim=1)
-            # swap_support_imgs = torch.where(should_swap, swapped, original)
-
-
-
-            query_out = model(
-                inputs_embeds=swap_support_imgs,
-                attention_mask=s_attention_mask,
-                uncausal_mask=img_uncausal_mask,
-                **lorm,
-            )
-            logits = query_out.logits[:, :Ss].contiguous().view(-1, vocab_size)  # [B, S-1, D] -> [B * (S-1), D]
-            target = support_labels.contiguous().view(-1)  # [B, S-1] -> [B * (S-1)]
-            qloss = F.cross_entropy(logits, target)
-            # final metalearning loss + query loss
-            # loss = loss + qloss
-            loss = qloss
-            #####
 
             if torch.isnan(loss):
                 print('NaN encountered:')
@@ -1316,6 +1495,12 @@ def run_epoch(model, img_proj, lor_models, inner_lr, dataloader, optimizer, devi
 
 global_epoch = 0
 
+# training
+num_epochs = 100
+batch_size = 32
+lr = 1e-4
+wd = 0.0
+
 # data
 train_alphabets = ["Latin", "Greek"]
 test_alphabets = ["Mongolian"]
@@ -1323,13 +1508,8 @@ img_size = 28
 n_way = 2  # N-way classification
 k_shot = 1  # k-shot learning
 q_query = 1  # query examples per class
-num_tasks = 100  # number of tasks per epoch
+num_tasks = batch_size * 3  # number of tasks per epoch
 
-# training
-num_epochs = 100
-batch_size = 32
-lr = 1e-4
-wd = 1e-2
 
 # INNER_OPT = 'sgd'
 INNER_OPT = 'sgd_momentum'
@@ -1342,8 +1522,8 @@ match INNER_OPT:
         INNER_LR = 1.0  # SGD-momentum needs much higher lr
         N_LOOPS = 20
     case 'sgd_momentum':
-        INNER_LR = 1.0  # SGD-momentum needs much higher lr
-        N_LOOPS = 20
+        INNER_LR = 0.7  # SGD-momentum needs much higher lr
+        N_LOOPS = 5
     case 'rmsprop':
         INNER_LR = 1e-1
         N_LOOPS = 20
@@ -1387,27 +1567,31 @@ lor_models = nn.ModuleDict(
     }
 )
 
-lor_models['lor_proj'][LOR_LAYER] = LORProject()
+for lor_layer in LOR_LAYERS:
 
-if WHICH_LOR == 1:
-    lor_models['lor_qs'][LOR_LAYER] = LORNorm(dim, dim, name='lor_qs')
-    lor_models['lor_ks'][LOR_LAYER] = LORNorm(dim, k_dim, name='lor_ks')
-    lor_models['lor_vs'][LOR_LAYER] = LORNorm(dim, v_dim, name='lor_vs')
-    lor_models['lor_os'][LOR_LAYER] = LORNorm(dim, dim, name='lor_os')
+    lor_models['lor_proj'][lor_layer] = LORProject()
 
-    lor_models['lor_gs'][LOR_LAYER] = LORNorm(dim, ff_dim, name='lor_gs')
-    lor_models['lor_us'][LOR_LAYER] = LORNorm(dim, ff_dim, name='lor_us')
-    lor_models['lor_ds'][LOR_LAYER] = LORNorm(dim, dim, name='lor_ds')
-elif WHICH_LOR == 2:
-    lor_models['lor_gs'][LOR_LAYER] = LORNorm(dim, ff_dim, name='lor_gs')
-    lor_models['lor_us'][LOR_LAYER] = LORNorm(dim, ff_dim, name='lor_us')
-    lor_models['lor_ds'][LOR_LAYER] = LORNorm(dim, dim, name='lor_ds')
-lor_models = lor_models.to(DEVICE, dtype=model.dtype)
+    if WHICH_LOR == 1:
+        lor_models['lor_qs'][lor_layer] = LORNorm(dim, dim, name='lor_qs')
+        lor_models['lor_ks'][lor_layer] = LORNorm(dim, k_dim, name='lor_ks')
+        lor_models['lor_vs'][lor_layer] = LORNorm(dim, v_dim, name='lor_vs')
+        lor_models['lor_os'][lor_layer] = LORNorm(dim, dim, name='lor_os')
+
+        lor_models['lor_gs'][lor_layer] = LORNorm(dim, ff_dim, name='lor_gs')
+        lor_models['lor_us'][lor_layer] = LORNorm(dim, ff_dim, name='lor_us')
+        lor_models['lor_ds'][lor_layer] = LORNorm(dim, dim, name='lor_ds')
+    elif WHICH_LOR == 2:
+        lor_models['lor_gs'][lor_layer] = LORNorm(dim, ff_dim, name='lor_gs')
+        lor_models['lor_us'][lor_layer] = LORNorm(dim, ff_dim, name='lor_us')
+        lor_models['lor_ds'][lor_layer] = LORNorm(dim, dim, name='lor_ds')
+    lor_models = lor_models.to(DEVICE, dtype=model.dtype)
 
 
 print_model_info(lor_models)
 add_hooks(lor_models)
 
+baked_metaweights = nn.Parameter(torch.randn(14, dim) * 1e-3)
+baked_metaweights = baked_metaweights.to(DEVICE)
 
 ##########
 # Image Projection
@@ -1673,16 +1857,16 @@ for epoch in range(num_epochs):
 
     # with torch.autograd.detect_anomaly():
     model.train()
-    train_loss = run_epoch(model, img_proj, lor_models, INNER_LR, train_dl, optimizer, DEVICE, train=True)
+    train_loss = run_epoch(model, img_proj, lor_models, baked_metaweights, INNER_LR, train_dl, optimizer, DEVICE, train=True)
 
-    train_losses.append(train_loss)
+    train_losses.append((global_epoch, train_loss))
     if LOG: writer.add_scalars('loss', {'train': train_loss}, global_epoch)
 
     if epoch % 5 == 0:
         model.eval()
         with torch.no_grad():
-            test_loss = run_epoch(model, img_proj, lor_models, INNER_LR, test_dl, optimizer, DEVICE, train=False)
-        test_losses.append(test_loss)
+            test_loss = run_epoch(model, img_proj, lor_models, baked_metaweights, INNER_LR, test_dl, optimizer, DEVICE, train=False)
+        test_losses.append((global_epoch, test_loss))
 
         if LOG: writer.add_scalars('loss', {'test': test_loss}, global_epoch)
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}")
@@ -1692,11 +1876,12 @@ for epoch in range(num_epochs):
 
 
 if num_epochs > 0:
-    l = len(test_losses)
-    epochs = list(range(l))
+    train_epochs, train_l = zip(*train_losses)
+    test_epochs, test_l = zip(*test_losses)
+
     plt.figure(figsize=(10, 6))
-    plt.plot(epochs, train_losses[:l], label='Training Loss', color='blue')
-    plt.plot(epochs, test_losses, label='Test Loss', color='red')
+    plt.plot(train_epochs, train_l, label='Training Loss', color='blue')
+    plt.plot(test_epochs, test_l, label='Test Loss', color='red')
 
     # Customize the plot
     plt.xlabel('Epochs')
@@ -1721,3 +1906,129 @@ for k in lor_models.keys():
             print(f'{k} | {n}')
             xs = [f'{x:>.3f}' for x in p.flatten()[:10].tolist()]
             print(f'{p.min().item():>.3f}, {p.max().item():>.3f}, {p.mean().item():>.3f}, {p.std().item():>.3f}, {xs}')
+
+
+
+
+#####
+# TORCHVIZ example
+
+if False:
+    import torch
+    from torchviz import make_dot
+    import torch.nn as nn
+
+    class SimpleNet(nn.Module):
+        def __init__(self):
+            super(SimpleNet, self).__init__()
+            self.fc1 = nn.Linear(3, 4)
+            self.relu = nn.ReLU()
+            self.fc2 = nn.Linear(4, 1)
+
+        def forward(self, x):
+            x = self.fc1(x)
+            x = self.relu(x)
+            x = self.fc2(x)
+            return x
+
+    # Create model and input
+    model = SimpleNet()
+    x = torch.randn(1, 3, requires_grad=True)
+    y = model(x)
+
+    # Generate PNG
+    dot = make_dot(y, params=dict(model.named_parameters()))
+    dot.render("computation_graph", format="png")
+
+    # Or log to tensorboard
+    from torch.utils.tensorboard import SummaryWriter
+
+    writer = SummaryWriter('runs/example')
+    writer.add_graph(model, x)
+    writer.close()
+
+
+
+
+
+##################################################
+# double check parsing
+
+# START_BLOCK_4
+
+if False:
+    # Mock helper function that would be defined elsewhere
+
+
+    # Setup test data
+    batch_size = 3
+    seq_len = 20
+    hidden_dim = 1
+    num_layers = 3
+    hidden_states = torch.arange(batch_size * seq_len * hidden_dim).reshape(batch_size, seq_len, hidden_dim)
+    lor_ixs_per_layer = [
+        None,
+        torch.tensor([[1, 1 + 14],
+                      [-1, -1],
+                      [3, 3 + 14]], dtype=torch.long),
+        None,
+    ]
+
+    print("Testing build_parses...")
+
+    # Test build_parses
+    parses = build_parses(lor_ixs_per_layer, hidden_states, num_layers)
+
+    print('--------------------------------------------------')
+    print(select_spans(hidden_states, lor_ixs_per_layer[1]))
+    print('--------------------------------------------------')
+    print(parses[1])
+
+    # # Assertions for build_parses
+    # assert parses[0] is None, "Layer 0 should be None"
+    # assert parses[2] is None, "Layer 2 should be None"
+    # p = torch.tensor([[[1], [2], [3], [4]],
+    #                   [[0], [0], [0], [0]],
+    #                   [[19], [20], [21], [22]]])
+    # assert torch.equal(parses[1], p), "Layer 1 parses incorrect"
+
+    # print("build_parses tests passed!")
+
+    print("\nTesting apply_lor_models...")
+
+    # Create mock LOR models
+    class MockProj(nn.Module):
+        def forward(self, x):
+            out = []
+            for i in range(14):
+                out.append(x[:, i] + 1)
+            return out
+
+    class MockLorNorm(nn.Module):
+        def forward(self, x):
+            return x * 10
+
+
+    lor_models = {
+        'lor_proj': [None, MockProj(), None],
+        'lor_qs': [None, MockLorNorm(), None],
+        'lor_ks': [None, MockLorNorm(), None],
+        'lor_vs': [None, MockLorNorm(), None],
+        'lor_os': [None, MockLorNorm(), None],
+        'lor_gs': [None, MockLorNorm(), None],
+        'lor_us': [None, MockLorNorm(), None],
+        'lor_ds': [None, MockLorNorm(), None],
+    }
+
+    # Initialize empty cache
+    lor_cache = empty_lors(num_layers)
+
+    # Test apply_lor_models
+    new_cache = apply_lor_models(parses, lor_models, lor_cache, num_layers)
+
+    print(new_cache)
+    # Assertions for apply_lor_models
+
+    print("apply_lor_models tests passed!")
+
+# END_BLOCK_4

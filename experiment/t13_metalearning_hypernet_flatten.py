@@ -26,6 +26,10 @@ TEST = True
 # NOTE: these currently loop over the batch dim, and still use the `F` api. Ideally, they'd be implemented more efficiently.
 
 
+# *****
+# SEE t13_metalearning_hypernet_autoencoder_functional_03 for NON-LOOP VERSIONS
+# *****
+
 def batch_embedding(input, weight, padding_idx=None):
     batch_size = input.shape[0]
     outputs = []
