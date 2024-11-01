@@ -391,35 +391,95 @@ class RandomScale(nn.Module):
         s = torch.rand_like(x) * self.scale
         return x * s
 
+
+class NullOp(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+    def forward(self, x):
+        return x
+
+
+class SRWM(nn.Module):
+    def __init__(self, d_in, d_out):
+        super().__init__()
+        self.d_in = d_in
+        self.d_out = d_out
+        self.w_init = nn.Parameter(torch.randn(
+            d_out + d_in * 2 + 4,  # y, k, q, lr=(wy, wk, yq, wlr)  # separate lr for targeting each submatrix
+            d_in
+        ))
+        nn.init.xavier_uniform_(self.w_init)
+
+    def forward(self, x, w):
+        # note: for supervised tasks, use x. for unsupervised tasks use softmax(x)
+        out = torch.einsum('bed, bd -> be', w, x)
+        y, k, q, b1, b2, b3, b4 = torch.split(out, [self.d_out, self.d_in, self.d_in, 1, 1, 1, 1], dim=1)
+        kphi = k.softmax(dim=1)
+        qphi = q.softmax(dim=1)
+        vbar = torch.einsum('bed, bd -> be', w, kphi)
+        v    = torch.einsum('bed, bd -> be', w, qphi)
+        beta = torch.cat([
+            b1.expand(-1, self.d_out),
+            b2.expand(-1, self.d_in),
+            b3.expand(-1, self.d_in),
+            b4.expand(-1, 4)
+        ], dim=1)
+        dw = beta.sigmoid().unsqueeze(2) * torch.einsum('be, bd -> bed', v - vbar, kphi)
+        w_out = w + dw
+        return y, w_out
+
+# @@@@@@@@@@
+# usage
+if False:
+    B = 5
+    d_in = 7
+    d_out = 3
+    x = torch.randn(B, d_in)
+    model = SRWM(d_in, d_out)
+    w = model.w_init.unsqueeze(0).repeat(B, 1, 1)
+    y, w_out = model(x, w)
+    brk
+# @@@@@@@@@@
+
+
 class Model(nn.Module):
     def __init__(self, dim, img_dim):
         super().__init__()
         self.dim = dim
 
+        # image input
+        # norm = nn.BatchNorm2d
+        norm = NullOp
         self.img_in = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=8, kernel_size=3, stride=1, padding=1), nn.GELU(), nn.AdaptiveAvgPool2d((16, 16)), nn.BatchNorm2d(8),
-            nn.Conv2d(in_channels=8, out_channels=16, kernel_size=3, stride=1, padding=1), nn.GELU(), nn.AdaptiveAvgPool2d((8, 8)), nn.BatchNorm2d(16),
-            nn.Conv2d(in_channels=16, out_channels=1, kernel_size=3, stride=1, padding=1), nn.GELU(), nn.AdaptiveAvgPool2d((8, 8)), nn.BatchNorm2d(1),
+            nn.Conv2d(in_channels=1, out_channels=32, kernel_size=3, stride=1, padding=1), norm(32), nn.AdaptiveAvgPool2d((8, 8)), nn.GELU(),
+            nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, stride=1, padding=1), norm(32), nn.AdaptiveAvgPool2d((8, 8)), nn.GELU(),
+            nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, stride=1, padding=1), norm(32), nn.AdaptiveAvgPool2d((8, 8)), nn.GELU(),
+            nn.Conv2d(in_channels=32, out_channels=1, kernel_size=3, stride=1, padding=1), norm(1), nn.AdaptiveAvgPool2d((8, 8)), nn.GELU(),
 
             nn.Flatten(1, -1),
             nn.Dropout(0.2),
             nn.Linear(8 ** 2, dim, bias=False),
         )
+
+        # label input
         self.emb = nn.Parameter(torch.randn(n_way, label_dim))
         torch.nn.init.orthogonal_(self.emb)
 
+        # backbone
         self.w1 = nn.Parameter(torch.randn(dim, dim))
         torch.nn.init.orthogonal_(self.w1)
 
         self.w2 = nn.Parameter(torch.randn(dim, dim))
         torch.nn.init.orthogonal_(self.w2)
 
-        self.tags = nn.Parameter(torch.randn(7, dim))
         # l1, r1, l2, r2: lor tags
         # q: query tag
         # serr, qerr: support/query error tag
-
+        self.tags = nn.Parameter(torch.randn(7, dim))
         torch.nn.init.orthogonal_(self.tags)
+
+
 
     def net(self, x, w1, w2):
         x = torch.einsum('bed, bd -> be', w1, x)
@@ -472,7 +532,9 @@ class Model(nn.Module):
 
             pass
 
-        (l1e, r1e, l2e, r2e, qe, serr, qerr) = self.tags
+        (l1e, r1e, l2e, r2e,
+         qe,
+         serr, qerr) = self.tags
 
         l1s = []
         r1s = []
@@ -498,7 +560,43 @@ class Model(nn.Module):
             # r2s.append(bind)
 
 
-        # Apply LORs
+        # #####
+        # # Metalearning
+
+        # # Apply LORs
+        # l1s = torch.stack(l1s, dim=1).requires_grad_()
+        # r1s = torch.stack(r1s, dim=1).requires_grad_()
+        # l2s = torch.stack(l2s, dim=1).requires_grad_()
+        # r2s = torch.stack(r2s, dim=1).requires_grad_()
+
+        # with torch.enable_grad():
+        #     params = [l1s, r1s, l2s, r2s]
+        #     opt_state = opt_state_fn(params)
+
+        #     for _ in range(N_LOOPS):
+        #         sw1 = w1 + torch.einsum('bsl, bsr -> blr', l1s, r1s)
+        #         sw2 = w2 + torch.einsum('bsl, bsr -> blr', l2s, r2s)
+
+        #         # Use LORs on support images
+        #         pred_embs = []
+        #         for six in range(S):
+        #             pred = self.net(sxs[:, six] + qe, sw1, sw2)  # query tag on support images
+        #             pred_embs.append(pred)
+
+        #         # task loss
+        #         pred_embs = torch.stack(pred_embs, dim=1)  # [B, S, D]
+        #         pred_labels = torch.einsum('ld, bsd -> bsl', self.emb, pred_embs);    assert pred_labels.shape == torch.Size([B, sys.shape[1], n_way])
+        #         task_loss = F.cross_entropy(pred_labels.view(-1, n_way),
+        #                                     sys.view(-1))
+
+        #         grads = torch.autograd.grad(task_loss, params, create_graph=True)
+
+        #         [l1s, r1s, l2s, r2s], opt_state = opt_fn(params, grads, opt_state, lr=inner_lr)
+
+
+        #####
+        # Test
+
         l1s = torch.stack(l1s, dim=1)
         r1s = torch.stack(r1s, dim=1)
         l2s = torch.stack(l2s, dim=1)
@@ -507,7 +605,6 @@ class Model(nn.Module):
         qw1 = w1 + torch.einsum('bsl, bsr -> blr', l1s, r1s)
         qw2 = w2 + torch.einsum('bsl, bsr -> blr', l2s, r2s)
 
-        # Use LORs on query images
         pred_embs = []
         for qix in range(Q):
             pred = self.net(qxs[:, qix] + qe, qw1, qw2)
@@ -519,19 +616,20 @@ class Model(nn.Module):
         task_loss = F.cross_entropy(pred_labels.view(-1, n_way),
                                     qys.view(-1))
 
-        # error prediction
-        error = pred_embs - qys_emb
-        error_preds = []
-        for qix in range(Q):
-            bound = qxs[:, qix] + qys_emb[:, qix]
-            error_preds.append(self.net(bound + serr, qw1, qw2))
-        error_pred = torch.stack(error_preds, dim=1)
-        error_pred_loss = F.mse_loss(error, error_pred)
 
+        # #####
+        # # error prediction
+        # error = pred_embs - qys_emb
+        # error_preds = []
+        # for qix in range(Q):
+        #     bound = qxs[:, qix]  # + qys_emb[:, qix]
+        #     error_preds.append(self.net(bound + qerr, qw1, qw2))
+        # error_pred = torch.stack(error_preds, dim=1)
+        # error_pred_loss = F.mse_loss(error, error_pred)
 
-        w_loss = torch.zeros(1, device=DEVICE, dtype=torch.float)
-        loss = task_loss + alpha * w_loss + error_pred_loss
-        return loss, task_loss, w_loss
+        fake_loss = torch.tensor(0.).to(DEVICE)
+        loss = task_loss
+        return loss, task_loss, fake_loss
 
 
 
@@ -556,8 +654,8 @@ match INNER_OPT:
         opt_state_fn = sgd_init
         opt_fn = sgd
     case 'sgd_momentum':
-        INNER_LR = 0.1  # SGD-momentum needs much higher lr
-        N_LOOPS = 5
+        INNER_LR = 0.5  # SGD-momentum needs much higher lr
+        N_LOOPS = 3
         opt_state_fn = sgd_momentum_init
         opt_fn = sgd_momentum
     case 'rmsprop':
