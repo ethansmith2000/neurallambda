@@ -63,7 +63,7 @@ train_alphabets = ["Latin", "Greek"]
 test_alphabets = ["Mongolian"]
 img_size = 28
 n_way = 2  # N-way classification
-k_shot = 1  # k-shot learning
+k_shot = 3  # k-shot learning
 q_query = 1  # query examples per class
 num_tasks = B * 50  # number of tasks per epoch
 
@@ -410,6 +410,7 @@ class SRWM(nn.Module):
             d_in
         ))
         nn.init.xavier_uniform_(self.w_init)
+        # nn.init.orthogonal_(self.w_init)
 
     def forward(self, x, w):
         # note: for supervised tasks, use x. for unsupervised tasks use softmax(x)
@@ -429,6 +430,7 @@ class SRWM(nn.Module):
         w_out = w + dw
         return y, w_out
 
+
 # @@@@@@@@@@
 # usage
 if False:
@@ -443,22 +445,26 @@ if False:
 # @@@@@@@@@@
 
 
+
 class Model(nn.Module):
     def __init__(self, dim, img_dim):
         super().__init__()
         self.dim = dim
 
         # image input
-        # norm = nn.BatchNorm2d
-        norm = NullOp
+        norm = nn.BatchNorm2d
+        # norm = NullOp
+
+        drp_p = 0.3
+        drp = nn.Dropout
+        # drp = NullOp
         self.img_in = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=32, kernel_size=3, stride=1, padding=1), norm(32), nn.AdaptiveAvgPool2d((8, 8)), nn.GELU(),
-            nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, stride=1, padding=1), norm(32), nn.AdaptiveAvgPool2d((8, 8)), nn.GELU(),
-            nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, stride=1, padding=1), norm(32), nn.AdaptiveAvgPool2d((8, 8)), nn.GELU(),
-            nn.Conv2d(in_channels=32, out_channels=1, kernel_size=3, stride=1, padding=1), norm(1), nn.AdaptiveAvgPool2d((8, 8)), nn.GELU(),
+            nn.Conv2d(in_channels=1, out_channels=32, kernel_size=3, stride=1, padding=1), norm(32), nn.AdaptiveAvgPool2d((8, 8)), drp(drp_p), nn.GELU(),
+            nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, stride=1, padding=1), norm(32), nn.AdaptiveAvgPool2d((8, 8)), drp(drp_p), nn.GELU(),
+            nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, stride=1, padding=1), norm(32), nn.AdaptiveAvgPool2d((8, 8)), drp(drp_p), nn.GELU(),
+            nn.Conv2d(in_channels=32, out_channels=1, kernel_size=3, stride=1, padding=1), norm(1), nn.AdaptiveAvgPool2d((8, 8)), drp(drp_p), nn.GELU(),
 
             nn.Flatten(1, -1),
-            nn.Dropout(0.2),
             nn.Linear(8 ** 2, dim, bias=False),
         )
 
@@ -503,34 +509,6 @@ class Model(nn.Module):
         # embed outputs
         qxs = self.img_in(qxs.view(-1, 1, img_dim, img_dim)).view(B, n_way * q_query, -1)  # [B, Q, D]
         qys_emb = self.emb[qys]
-
-        # with torch.enable_grad():
-        #     opt_state = None
-        #     w = (self.w1.unsqueeze(0).repeat(B, 1, 1) + 0).requires_grad_()
-        if False:
-            # for _ in range(N_LOOPS):
-            #     # pass images through w
-            #     pxs = torch.einsum('bed, bnd -> bne', w, sxs)
-            #     # build outer pdt
-            #     op = torch.einsum('bsd, bse -> bde', pxs, sys_emb)  # outer pdt of images and labels
-
-            #     # pass images through outer pdt
-            #     pred_labels = torch.einsum('bde, bnd -> bne', op, pxs)
-
-            #     # predict label
-            #     pred_labels = torch.einsum('ld, bnd -> bnl', self.emb, pred_labels)
-            #     loss = F.cross_entropy(
-            #         pred_labels.view(-1, n_way),
-            #         sys.view(-1)
-            #     )
-            #     grads = torch.autograd.grad(loss, w, create_graph=True)
-
-            # opt_state = opt_state_fn(w)
-            # new_params, opt_state = opt_fn(w, grads, opt_state, lr=inner_lr)
-
-            #     w = new_params[0]
-
-            pass
 
         (l1e, r1e, l2e, r2e,
          qe,
@@ -612,9 +590,15 @@ class Model(nn.Module):
 
         # task loss
         pred_embs = torch.stack(pred_embs, dim=1)  # [B, Q, D]
+
+        # pred_embs = torch.randn_like(pred_embs)
+
         pred_labels = torch.einsum('ld, bqd -> bql', self.emb, pred_embs);    assert pred_labels.shape == torch.Size([B, qys.shape[1], n_way])
         task_loss = F.cross_entropy(pred_labels.view(-1, n_way),
                                     qys.view(-1))
+
+        n_correct = (pred_labels.view(-1, n_way).argmax(dim=1) == qys.view(-1)).sum()
+        n_q = B * Q
 
 
         # #####
@@ -629,7 +613,148 @@ class Model(nn.Module):
 
         fake_loss = torch.tensor(0.).to(DEVICE)
         loss = task_loss
-        return loss, task_loss, fake_loss
+        return loss, task_loss, fake_loss, n_correct, n_q
+
+
+
+
+# class Model(nn.Module):
+#     def __init__(self, dim, img_dim):
+#         super().__init__()
+#         self.dim = dim
+
+#         # image input
+#         # norm = nn.BatchNorm2d
+#         norm = NullOp
+
+#         drp_p = 0.1
+#         drp = nn.Dropout
+#         # drp = NullOp
+#         self.img_in = nn.Sequential(
+#             nn.Conv2d(in_channels=1, out_channels=32, kernel_size=3, stride=1, padding=1), norm(32), nn.AdaptiveAvgPool2d((8, 8)), drp(drp_p), nn.GELU(),
+#             nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, stride=1, padding=1), norm(32), nn.AdaptiveAvgPool2d((8, 8)), drp(drp_p), nn.GELU(),
+#             nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, stride=1, padding=1), norm(32), nn.AdaptiveAvgPool2d((8, 8)), drp(drp_p), nn.GELU(),
+#             nn.Conv2d(in_channels=32, out_channels=1, kernel_size=3, stride=1, padding=1), norm(1), nn.AdaptiveAvgPool2d((8, 8)), drp(drp_p), nn.GELU(),
+
+#             nn.Flatten(1, -1),
+#             nn.Linear(8 ** 2, dim, bias=False),
+#         )
+
+#         # label input
+#         self.emb = nn.Parameter(torch.randn(n_way, label_dim))
+#         torch.nn.init.orthogonal_(self.emb)
+
+#         # backbone
+#         self.net1 = SRWM(dim*2, dim)
+#         self.net2 = SRWM(dim, dim)
+
+#         # # l1, r1, l2, r2: lor tags
+#         # # q: query tag
+#         # # serr, qerr: support/query error tag
+#         # self.tags = nn.Parameter(torch.randn(7, dim))
+#         # torch.nn.init.orthogonal_(self.tags)
+
+#     def net(self, x, w1, w2):
+#         x, w1 = self.net1(x, w1)
+#         x = F.gelu(x)
+#         x, w2 = self.net2(x, w2)
+#         return x, w1, w2
+
+
+#     def forward(self,
+#                 query_w,
+#                 sxs, sys,  # support xs/ys
+#                 qxs, qys,  # query xs/ys
+#                 inner_lr):
+#         B = query_w.shape[0]
+#         S = sxs.shape[1]
+#         Q = qxs.shape[1]
+
+#         # embed inputs
+#         sxs    = self.img_in(sxs.view(-1, 1, img_dim, img_dim)).view(B, n_way * k_shot, -1)  # [B, S, D]
+#         sys_emb = self.emb[sys]
+
+#         # embed outputs
+#         qxs = self.img_in(qxs.view(-1, 1, img_dim, img_dim)).view(B, n_way * q_query, -1)  # [B, Q, D]
+#         qys_emb = self.emb[qys]
+
+#         w1 = self.net1.w_init.unsqueeze(0).repeat(B, 1, 1)
+#         w2 = self.net2.w_init.unsqueeze(0).repeat(B, 1, 1)
+
+#         # Build up LORs based on Supports
+#         for six in range(S):
+#             # bound = sxs[:, six] + sys_emb[:, six]
+#             bound = torch.cat([sxs[:, six], sys_emb[:, six]], dim=1)
+#             y, w1, w2 = self.net(bound, w1, w2)
+
+#         # #####
+#         # # Metalearning
+
+#         # # Apply LORs
+#         # l1s = torch.stack(l1s, dim=1).requires_grad_()
+#         # r1s = torch.stack(r1s, dim=1).requires_grad_()
+#         # l2s = torch.stack(l2s, dim=1).requires_grad_()
+#         # r2s = torch.stack(r2s, dim=1).requires_grad_()
+
+#         # with torch.enable_grad():
+#         #     params = [l1s, r1s, l2s, r2s]
+#         #     opt_state = opt_state_fn(params)
+
+#         #     for _ in range(N_LOOPS):
+#         #         sw1 = w1 + torch.einsum('bsl, bsr -> blr', l1s, r1s)
+#         #         sw2 = w2 + torch.einsum('bsl, bsr -> blr', l2s, r2s)
+
+#         #         # Use LORs on support images
+#         #         pred_embs = []
+#         #         for six in range(S):
+#         #             pred = self.net(sxs[:, six] + qe, sw1, sw2)  # query tag on support images
+#         #             pred_embs.append(pred)
+
+#         #         # task loss
+#         #         pred_embs = torch.stack(pred_embs, dim=1)  # [B, S, D]
+#         #         pred_labels = torch.einsum('ld, bsd -> bsl', self.emb, pred_embs);    assert pred_labels.shape == torch.Size([B, sys.shape[1], n_way])
+#         #         task_loss = F.cross_entropy(pred_labels.view(-1, n_way),
+#         #                                     sys.view(-1))
+
+#         #         grads = torch.autograd.grad(task_loss, params, create_graph=True)
+
+#         #         [l1s, r1s, l2s, r2s], opt_state = opt_fn(params, grads, opt_state, lr=inner_lr)
+
+
+#         #####
+#         # Test
+
+#         pred_embs = []
+#         for qix in range(Q):
+#             z = torch.zeros(B, D, device=DEVICE)
+#             q = torch.cat([qxs[:, qix], z], dim=1)
+#             pred, w1, w2 = self.net(q, w1, w2)
+#             pred_embs.append(pred)
+
+#         # task loss
+#         pred_embs = torch.stack(pred_embs, dim=1)  # [B, Q, D]
+#         pred_labels = torch.einsum('ld, bqd -> bql', self.emb, pred_embs);    assert pred_labels.shape == torch.Size([B, qys.shape[1], n_way])
+#         task_loss = F.cross_entropy(pred_labels.view(-1, n_way),
+#                                     qys.view(-1))
+
+#         n_correct = (pred_labels.view(-1, n_way).argmax(dim=1) == qys.view(-1)).sum()
+#         n_q = B * Q
+
+#         # #####
+#         # # error prediction
+#         # error = pred_embs - qys_emb
+#         # error_preds = []
+#         # for qix in range(Q):
+#         #     bound = qxs[:, qix]  # + qys_emb[:, qix]
+#         #     error_preds.append(self.net(bound + qerr, qw1, qw2))
+#         # error_pred = torch.stack(error_preds, dim=1)
+#         # error_pred_loss = F.mse_loss(error, error_pred)
+
+#         fake_loss = torch.tensor(0.).to(DEVICE)
+#         loss = task_loss
+#         return loss, task_loss, fake_loss, n_correct, n_q
+
+
 
 
 
@@ -698,6 +823,9 @@ def run_epoch(model, dataloader, inner_lr, optimizer, device, train=True):
     total_weight_loss = 0
     total_samples = 0
 
+    total_correct = 0
+    total_queries = 0
+
     with torch.set_grad_enabled(train):
         for batch in dataloader:
             supports, queries = batch
@@ -709,7 +837,9 @@ def run_epoch(model, dataloader, inner_lr, optimizer, device, train=True):
             B = support_imgs.shape[0]
             query_w = torch.randn((B, D)).to(DEVICE)
 
-            loss, task_loss, w_loss = model(query_w, support_imgs, support_labels, query_imgs, query_labels, inner_lr)
+            loss, task_loss, w_loss, n_correct, n_q = model(query_w, support_imgs, support_labels, query_imgs, query_labels, inner_lr)
+            total_correct += n_correct
+            total_queries += n_q
 
             if torch.isnan(loss):
                 print('NaN encountered:')
@@ -732,7 +862,8 @@ def run_epoch(model, dataloader, inner_lr, optimizer, device, train=True):
     return (
         total_loss / total_samples,
         total_task_loss / total_samples,
-        total_weight_loss / total_samples
+        total_weight_loss / total_samples,
+        total_correct / total_queries
     )
 
 
@@ -744,21 +875,21 @@ for epoch in range(num_epochs):
 
     # with torch.autograd.detect_anomaly():
     model.train()
-    train_loss, train_task_loss, train_weight_loss = run_epoch(model, train_dl, INNER_LR, optimizer, DEVICE, train=True)
+    train_loss, train_task_loss, train_weight_loss, train_acc = run_epoch(model, train_dl, INNER_LR, optimizer, DEVICE, train=True)
 
     train_losses.append((global_epoch, train_loss))
 
     if epoch % 40 == 0:
         model.eval()
         with torch.no_grad():
-            test_loss, test_task_loss, test_weight_loss = run_epoch(model, test_dl, INNER_LR, optimizer, DEVICE, train=False)
+            test_loss, test_task_loss, test_weight_loss, test_acc = run_epoch(model, test_dl, INNER_LR, optimizer, DEVICE, train=False)
         test_losses.append((global_epoch, test_loss))
-        print(f"Epoch {global_epoch}/{num_epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}")
+        print(f"Epoch {global_epoch}/{num_epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}, Train Acc: {train_acc:>.2f}, Test Acc: {test_acc:>.2f}")
         print(f'    TRAIN: task_loss: {train_task_loss:>.3f}, w_loss: {train_weight_loss:>.3f}')
         print(f'    TEST:  task_loss: {test_task_loss:>.3f}, w_loss: {test_weight_loss:>.3f}')
 
     elif epoch % 10 == 0:
-        print(f"Epoch {global_epoch}/{num_epochs}, Train Loss: {train_loss:.4f}")
+        print(f"Epoch {global_epoch}/{num_epochs}, Train Loss: {train_loss:.4f}, Train Acc: {train_acc:>.2f}")
 
 
 # END_BLOCK_1
