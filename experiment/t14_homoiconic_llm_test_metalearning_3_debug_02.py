@@ -455,7 +455,7 @@ class Model(nn.Module):
         norm = nn.BatchNorm2d
         # norm = NullOp
 
-        drp_p = 0.3
+        drp_p = 0.5
         drp = nn.Dropout
         # drp = NullOp
         self.img_in = nn.Sequential(
@@ -482,16 +482,21 @@ class Model(nn.Module):
         # l1, r1, l2, r2: lor tags
         # q: query tag
         # serr, qerr: support/query error tag
-        self.tags = nn.Parameter(torch.randn(7, dim))
+        # hs: hidden state
+        self.tags = nn.Parameter(torch.randn(8, dim))
         torch.nn.init.orthogonal_(self.tags)
 
+        self.dfa_l1 = (torch.randn(dim) * 1)
+        self.dfa_r1 = (torch.randn(dim) * 1)
+        self.dfa_l2 = (torch.randn(dim) * 1)
+        self.dfa_r2 = (torch.randn(dim) * 1)
 
 
     def net(self, x, w1, w2):
-        x = torch.einsum('bed, bd -> be', w1, x)
-        x = F.gelu(x)
-        x = torch.einsum('bed, bd -> be', w2, x)
-        return x
+        h = torch.einsum('bed, bd -> be', w1, x)
+        ah = F.gelu(h)
+        y = torch.einsum('bed, bd -> be', w2, ah)
+        return y, h
 
     def forward(self,
                 query_w,
@@ -512,7 +517,8 @@ class Model(nn.Module):
 
         (l1e, r1e, l2e, r2e,
          qe,
-         serr, qerr) = self.tags
+         serr, qerr,
+         hs) = self.tags
 
         l1s = []
         r1s = []
@@ -525,17 +531,20 @@ class Model(nn.Module):
         # Build up LORs based on Supports
         for six in range(S):
 
-            bound = sxs[:, six] + sys_emb[:, six]
-            l1s.append(self.net(bound + l1e, w1, w2))
-            r1s.append(self.net(bound + r1e, w1, w2))
-            l2s.append(self.net(bound + l2e, w1, w2))
-            r2s.append(self.net(bound + r2e, w1, w2))
+            bound = (
+                sxs[:, six]  +
+                sys_emb[:, six]  #  * torch.rand(B, D, device=DEVICE)  # EXPERIMENT: noise
+            )
 
-            # bind = torch.randn(B, D, device=DEVICE)
-            # l1s.append(bind)
-            # r1s.append(sxs[:, six])
-            # l2s.append(sys_emb[:, six])
-            # r2s.append(bind)
+            l1s.append(self.net(bound + l1e, w1, w2)[0])
+            r1s.append(self.net(bound + r1e, w1, w2)[0])
+            l2s.append(self.net(bound + l2e, w1, w2)[0])
+            r2s.append(self.net(bound + r2e, w1, w2)[0])
+
+            # l1s.append(self.net(bound + torch.randn_like(bound) * 1e-1, w1, w2))
+            # r1s.append(self.net(bound + torch.randn_like(bound) * 1e-1, w1, w2))
+            # l2s.append(self.net(bound + torch.randn_like(bound) * 1e-1, w1, w2))
+            # r2s.append(self.net(bound + torch.randn_like(bound) * 1e-1, w1, w2))
 
 
         # #####
@@ -558,7 +567,7 @@ class Model(nn.Module):
         #         # Use LORs on support images
         #         pred_embs = []
         #         for six in range(S):
-        #             pred = self.net(sxs[:, six] + qe, sw1, sw2)  # query tag on support images
+        #             pred, _ = self.net(sxs[:, six] + qe, sw1, sw2)  # query tag on support images
         #             pred_embs.append(pred)
 
         #         # task loss
@@ -568,8 +577,42 @@ class Model(nn.Module):
         #                                     sys.view(-1))
 
         #         grads = torch.autograd.grad(task_loss, params, create_graph=True)
-
         #         [l1s, r1s, l2s, r2s], opt_state = opt_fn(params, grads, opt_state, lr=inner_lr)
+
+
+        # #####
+        # # DFA Metalearning
+
+        # # Apply LORs
+        # l1s = torch.stack(l1s, dim=1)  # [B, S, D]
+        # r1s = torch.stack(r1s, dim=1)
+        # l2s = torch.stack(l2s, dim=1)
+        # r2s = torch.stack(r2s, dim=1)
+
+        # N_DFA_LOOPS = 5
+        # DFA_LR = 1e-3
+        # for _ in range(N_DFA_LOOPS):
+        #     sw1 = w1 + torch.einsum('bsl, bsr -> blr', l1s, r1s)
+        #     sw2 = w2 + torch.einsum('bsl, bsr -> blr', l2s, r2s)
+
+        #     # Use LORs on support images
+        #     pred_embs = []
+        #     for six in range(S):
+        #         pred, _ = self.net(sxs[:, six] + qe, sw1, sw2)  # query tag on support images
+        #         pred_embs.append(pred)
+
+        #     # task loss
+        #     pred_embs = torch.stack(pred_embs, dim=1)  # [B, S, D]
+        #     pred_labels = torch.einsum('ld, bsd -> bsl', self.emb, pred_embs);    assert pred_labels.shape == torch.Size([B, sys.shape[1], n_way])
+        #     task_loss = F.cross_entropy(pred_labels.view(-1, n_way), sys.view(-1), reduction='none')
+
+        #     task_loss = -task_loss.view(B, S).unsqueeze(2).repeat(1, 1, D) * DFA_LR
+
+        #     l1s = l1s + self.dfa_l1.to(DEVICE).expand(B, S, -1) * task_loss
+        #     r1s = r1s + self.dfa_r1.to(DEVICE).expand(B, S, -1) * task_loss
+        #     l2s = l2s + self.dfa_l2.to(DEVICE).expand(B, S, -1) * task_loss
+        #     r2s = r2s + self.dfa_r2.to(DEVICE).expand(B, S, -1) * task_loss
+
 
 
         #####
@@ -580,12 +623,15 @@ class Model(nn.Module):
         l2s = torch.stack(l2s, dim=1)
         r2s = torch.stack(r2s, dim=1)
 
-        qw1 = w1 + torch.einsum('bsl, bsr -> blr', l1s, r1s)
-        qw2 = w2 + torch.einsum('bsl, bsr -> blr', l2s, r2s)
+        # qw1 = w1 + torch.einsum('bsl, bsr -> blr', l1s, r1s)
+        # qw2 = w2 + torch.einsum('bsl, bsr -> blr', l2s, r2s)
+
+        qw1 = w1 * torch.einsum('bsl, bsr -> blr', l1s, r1s) # EXPERIMENT with *
+        qw2 = w2 * torch.einsum('bsl, bsr -> blr', l2s, r2s)
 
         pred_embs = []
         for qix in range(Q):
-            pred = self.net(qxs[:, qix] + qe, qw1, qw2)
+            pred, h = self.net(qxs[:, qix] + qe, qw1, qw2)
             pred_embs.append(pred)
 
         # task loss
@@ -611,8 +657,19 @@ class Model(nn.Module):
         # error_pred = torch.stack(error_preds, dim=1)
         # error_pred_loss = F.mse_loss(error, error_pred)
 
+
+        # #####
+        # # Hidden State Prediction
+        # h_err = []
+        # for qix in range(Q):
+        #     bound = qxs[:, qix]  # + qys_emb[:, qix]
+        #     h_pred, h_actual = self.net(bound + hs, qw1, qw2)
+        #     h_err.append(F.mse_loss(h_pred, h_actual))
+        # h_err_loss = torch.stack(h_err, dim=0).mean()
+
         fake_loss = torch.tensor(0.).to(DEVICE)
         loss = task_loss
+
         return loss, task_loss, fake_loss, n_correct, n_q
 
 
@@ -769,9 +826,6 @@ INNER_OPT = 'sgd_momentum'
 # INNER_OPT = 'adamax'
 
 
-
-
-
 match INNER_OPT:
     case 'sgd':
         INNER_LR = 1.0  # SGD-momentum needs much higher lr
@@ -879,7 +933,7 @@ for epoch in range(num_epochs):
 
     train_losses.append((global_epoch, train_loss))
 
-    if epoch % 40 == 0:
+    if epoch % 25 == 0:
         model.eval()
         with torch.no_grad():
             test_loss, test_task_loss, test_weight_loss, test_acc = run_epoch(model, test_dl, INNER_LR, optimizer, DEVICE, train=False)
