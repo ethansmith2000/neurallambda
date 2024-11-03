@@ -1,6 +1,6 @@
 '''
 
-A simple homoiconic MLP for solving the N-way k-shot task
+A simple homoiconic MLP for solving the N-way k-shot task. Upgrade so that LORs are derived from "Reasoning Embeddings", not linear weights.
 
 
 >>> nn.Conv2d(in_channels=5, out_channels=13, kernel_size=3, stride=1)(torch.randn((3, 5, 7, 11))).shape
@@ -486,17 +486,66 @@ class Model(nn.Module):
         self.tags = nn.Parameter(torch.randn(8, dim))
         torch.nn.init.orthogonal_(self.tags)
 
+        # EXPERIMENT: generate LORs from attention over "reasoning embs", not linear projections
+        n_r_embs = 16
+        n_r_heads = 4
+        head_dim = dim // n_r_heads
+        self.head_dim = head_dim
+
+        # RQ is a projection matrix
+        self.r_q = nn.Parameter(torch.randn(n_r_heads, head_dim, dim))
+        torch.nn.init.orthogonal_(self.r_q)
+
+        # RK and RV are "embeddings"
+        self.r_k = nn.Parameter(torch.randn(n_r_embs, n_r_heads, head_dim))
+        torch.nn.init.orthogonal_(self.r_k)
+
+        self.r_v = nn.Parameter(torch.randn(n_r_embs, n_r_heads, head_dim))
+        torch.nn.init.orthogonal_(self.r_v)
+
+        self.r_o = nn.Parameter(torch.randn(dim, dim))
+        torch.nn.init.orthogonal_(self.r_o)
+
+        self.r_ln = nn.LayerNorm(dim)
+        with torch.no_grad():
+            self.r_ln.weight[:] = torch.zeros_like(self.r_ln.weight) + 1e-3  # initially gate out lor info
+
+        # EXPERIMENT: DFA for Metalearning
         self.dfa_l1 = (torch.randn(dim) * 1)
         self.dfa_r1 = (torch.randn(dim) * 1)
         self.dfa_l2 = (torch.randn(dim) * 1)
         self.dfa_r2 = (torch.randn(dim) * 1)
 
 
+    def get_lor(self, x, w1, w2):
+        B, D = x.shape
+        q, _ = self.net(x, w1, w2)
+        q = torch.einsum('nhd, bd -> bnh', self.r_q, q)
+        attn_scores = torch.einsum('bnh, rnh -> bnr', q, self.r_k)
+        attn_scores = attn_scores / (self.head_dim ** 0.5)
+        # emb_attn = F.gumbel_softmax(emb_attn, dim=1, hard=True)
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        lor = torch.einsum('bnr, rnh -> bnh', attn_probs, self.r_v)
+        lor = lor.reshape(B, D)
+        lor = torch.einsum('de, bd -> be', self.r_o, lor)
+        lor = self.r_ln(lor + x)
+        return lor
+
+
     def net(self, x, w1, w2):
         h = torch.einsum('bed, bd -> be', w1, x)
         ah = F.gelu(h)
         y = torch.einsum('bed, bd -> be', w2, ah)
+        # EXPERIMENT: return h for self modelling loss
         return y, h
+
+        # # Unbactched weights
+        # h = torch.einsum('bed, bd -> be', w1, x)
+        # ah = F.gelu(h)
+        # y = torch.einsum('bed, bd -> be', w2, ah)
+        # # EXPERIMENT: return h for self modelling loss
+        # return y, h
+
 
     def forward(self,
                 query_w,
@@ -525,8 +574,13 @@ class Model(nn.Module):
         l2s = []
         r2s = []
 
+        # Batched weights
         w1 = self.w1.unsqueeze(0).repeat(B, 1, 1)
         w2 = self.w2.unsqueeze(0).repeat(B, 1, 1)
+
+        # # Unbatched weights
+        # w1 = self.w1
+        # w2 = self.w2
 
         # Build up LORs based on Supports
         for six in range(S):
@@ -536,10 +590,10 @@ class Model(nn.Module):
                 sys_emb[:, six]  #  * torch.rand(B, D, device=DEVICE)  # EXPERIMENT: noise
             )
 
-            l1s.append(self.net(bound + l1e, w1, w2)[0])
-            r1s.append(self.net(bound + r1e, w1, w2)[0])
-            l2s.append(self.net(bound + l2e, w1, w2)[0])
-            r2s.append(self.net(bound + r2e, w1, w2)[0])
+            l1s.append(self.get_lor(bound + l1e, w1, w2))
+            r1s.append(self.get_lor(bound + r1e, w1, w2))
+            l2s.append(self.get_lor(bound + l2e, w1, w2))
+            r2s.append(self.get_lor(bound + r2e, w1, w2))
 
             # l1s.append(self.net(bound + torch.randn_like(bound) * 1e-1, w1, w2))
             # r1s.append(self.net(bound + torch.randn_like(bound) * 1e-1, w1, w2))
@@ -614,7 +668,6 @@ class Model(nn.Module):
         #     r2s = r2s + self.dfa_r2.to(DEVICE).expand(B, S, -1) * task_loss
 
 
-
         #####
         # Test
 
@@ -623,11 +676,17 @@ class Model(nn.Module):
         l2s = torch.stack(l2s, dim=1)
         r2s = torch.stack(r2s, dim=1)
 
-        # qw1 = w1 + torch.einsum('bsl, bsr -> blr', l1s, r1s)
-        # qw2 = w2 + torch.einsum('bsl, bsr -> blr', l2s, r2s)
+        # EXPERIMENT: + LORS
+        qw1 = w1 + torch.einsum('bsl, bsr -> blr', l1s, r1s)
+        qw2 = w2 + torch.einsum('bsl, bsr -> blr', l2s, r2s)
 
-        qw1 = w1 * torch.einsum('bsl, bsr -> blr', l1s, r1s) # EXPERIMENT with *
-        qw2 = w2 * torch.einsum('bsl, bsr -> blr', l2s, r2s)
+        # # EXPERIMENT: only use lors
+        # qw1 = torch.einsum('bsl, bsr -> blr', l1s, r1s)
+        # qw2 = torch.einsum('bsl, bsr -> blr', l2s, r2s)
+
+        # EXPERIMENT with *
+        # qw1 = w1 * torch.einsum('bsl, bsr -> blr', l1s, r1s)
+        # qw2 = w2 * torch.einsum('bsl, bsr -> blr', l2s, r2s)
 
         pred_embs = []
         for qix in range(Q):
@@ -1179,3 +1238,73 @@ if False:
 
 
 # END_BLOCK_2
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# START_BLOCK_5
+
+
+# Parameters
+batch_size = 2
+seq_length = 3
+embed_dim = 32
+num_heads = 4
+head_dim = embed_dim // num_heads  # = 8
+
+# Create example input tensor (batch_size, embedding_dim)
+x = torch.randn(batch_size, embed_dim)
+
+# Create weights for Q projection and pre-baked K, V embeddings
+W_q = torch.randn(embed_dim, num_heads, head_dim)
+# K and V should have dimensions that include the sequence length and head_dim
+K = torch.randn(seq_length, num_heads, head_dim)  # Pre-baked K embeddings
+V = torch.randn(seq_length, num_heads, head_dim)  # Pre-baked V embeddings
+
+# Project input to Q (batch_size, num_heads, head_dim)
+Q = torch.einsum('be,ehd->bhd', x, W_q)
+
+# Expand K and V for batch dimension
+# K, V shape: (batch_size, seq_length, num_heads, head_dim)
+K = K.unsqueeze(0).expand(batch_size, -1, -1, -1)
+V = V.unsqueeze(0).expand(batch_size, -1, -1, -1)
+
+# Scaled dot-product attention
+scaling_factor = head_dim ** 0.5
+# Q shape: (batch, num_heads, head_dim)
+# K shape: (batch, seq_length, num_heads, head_dim)
+attention_scores = torch.einsum('bhd,bshd->bhs', Q, K) / scaling_factor
+attention_probs = torch.softmax(attention_scores, dim=-1)
+# attention_probs shape: (batch, num_heads, seq_length)
+# V shape: (batch, seq_length, num_heads, head_dim)
+attention_output = torch.einsum('bhs,bshd->bhd', attention_probs, V)
+
+# Reshape from (batch, num_heads, head_dim) to (batch, num_heads * head_dim)
+concat_output = attention_output.reshape(batch_size, num_heads * head_dim)
+
+# Create output projection weight
+W_o = torch.randn(embed_dim, embed_dim)
+
+# Final projection
+final_output = torch.einsum('bc,ce->be', concat_output, W_o)
+
+print("\nShape check:")
+print(f"Q shape: {Q.shape}")  # [batch_size, num_heads, head_dim]
+print(f"K shape: {K.shape}")  # [batch_size, seq_length, num_heads, head_dim]
+print(f"V shape: {V.shape}")  # [batch_size, seq_length, num_heads, head_dim]
+print(f"Attention scores shape: {attention_scores.shape}")  # [batch_size, num_heads, seq_length]
+print(f"Attention output shape (before concat): {attention_output.shape}")  # [batch_size, num_heads, head_dim]
+print(f"Concatenated shape: {concat_output.shape}")  # [batch_size, embed_dim]
+print(f"Final output shape: {final_output.shape}")  # [batch_size, embed_dim]
+
+# END_BLOCK_5
